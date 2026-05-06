@@ -1,8 +1,14 @@
+# ============================================================
+# 简历 RAG 智能问答系统 - 唯一配置文件
+# 修改后重新启动服务即可生效
+# 环境变量可覆盖（ES_HOST / APP_PORT / APP_MODE / LOG_LEVEL）
+# ============================================================
+
 app:
   name: "resume-rag-service"
   host: "0.0.0.0"
   port: 8080
-  mode: "release"
+  mode: "release"       # dev 模式自动开启热重载 + CORS *
 
 log:
   level: "info"
@@ -15,9 +21,9 @@ log:
 
 elasticsearch:
   hosts:
-    - "http://localhost:9200"
+    - "http://maco.hackercd.cn:9200"   # Docker 内用 http://elasticsearch:9200
   index: "pdf_knowledge_base"
-  vector_dim: 1024
+  vector_dim: 512              # BGE-small-zh-v1.5 实际输出 512 维
   request_timeout: 30
 
 embedding:
@@ -47,6 +53,6 @@ retrieval:
 
 cors:
   allowed_origins:
-    - "http://localhost:5000"
-    - "http://192.168.3.188:5000"
-    - "http://127.0.0.1:5000"
+    - "http://localhost:8080"
+    - "http://127.0.0.1:8080"
+    - "http://192.168.3.188:8080"

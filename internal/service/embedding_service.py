@@ -31,7 +31,7 @@ class EmbeddingService:
         self.cache_folder = cache_folder or emb_cfg.cache_folder
         self.max_concurrent = max_concurrent or emb_cfg.max_concurrent
         self.model = None
-        self.dim = 1024  # BGE-small-zh 输出维度
+        self.dim = 512  # BGE-small-zh-v1.5 实际输出 512 维（BGE-base 才是 1024）
         self._cache: Dict[str, np.ndarray] = {}  # 文本→向量缓存
         self._loaded = False
         self.logger = get_logger()

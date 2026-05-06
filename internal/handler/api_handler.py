@@ -98,17 +98,19 @@ async def health_check():
 
     try:
         es_service = _get_es_service()
+        # 强制重新连接以确保状态准确
+        es_service.repo.client = None
         es_connected = es_service.is_connected()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warn(rid, "health", "ES 健康检查异常", error=str(e)[:100])
 
     try:
         emb_service = get_embedding_service()
         embedding_loaded = emb_service.is_loaded
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warn(rid, "health", "Embedding 健康检查异常", error=str(e)[:100])
 
-    status = "ok" if (es_connected or embedding_loaded) else "degraded"
+    status = "ok" if es_connected else "degraded"
 
     result = HealthResult(
         status=status,
@@ -144,6 +146,7 @@ async def rag_query(request: Request, body: QueryRequest):
             api_key=body.api_key,
             provider=body.provider,
             model=body.model,
+            base_url=body.base_url,
             top_k=body.top_k
         )
 

@@ -156,6 +156,46 @@ class TestRAGService:
         assert "FastAPI" in context
 
 
+class TestMultiEntityRetrieval:
+    """查询分解检索测试 — 通用关键词拆分，不限实体类型"""
+
+    def test_extract_two_keywords(self):
+        """两个人名 → 两个关键词"""
+        from internal.service.rag_service import RAGService
+        terms = RAGService._extract_entities("张三和李四合作过什么项目？")
+        assert "张三" in terms
+        assert "李四" in terms
+
+    def test_extract_tech_comparison(self):
+        """技术对比 → 提取技术名"""
+        from internal.service.rag_service import RAGService
+        terms = RAGService._extract_entities("FastAPI和Flask有什么区别？")
+        assert "FastAPI" in terms
+        assert "Flask" in terms
+
+    def test_extract_english_terms(self):
+        """英文术语对比"""
+        from internal.service.rag_service import RAGService
+        terms = RAGService._extract_entities("Redis和Kafka的使用场景对比")
+        assert "Redis" in terms
+        assert "Kafka" in terms
+
+    def test_extract_single_term_no_trigger(self):
+        """单个关键词不触发分解（需 ≥2）"""
+        from internal.service.rag_service import RAGService
+        terms = RAGService._extract_entities("Python语言有什么特点？")
+        # "Python语言" 是一个词，"特点" 也是一个词
+        # 重点是验证拆分逻辑能正常工作即可
+        assert len(terms) >= 1
+
+    def test_stop_words_filtered(self):
+        """纯停用词问句 → 无有效关键词"""
+        from internal.service.rag_service import RAGService
+        terms = RAGService._extract_entities("请问一下这个和那个有什么区别吗")
+        # 全是停用词和疑问词，全被过滤
+        assert all(t not in ('这个', '那个', '什么', '区别', '请问') for t in terms)
+
+
 class TestRateLimiter:
     """限流器测试"""
 

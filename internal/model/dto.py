@@ -45,8 +45,9 @@ class QueryRequest(BaseModel):
                           description="用户问题")
     api_key: str = Field(..., min_length=1,
                          description="LLM API Key，后端不存储，仅透传")
-    provider: str = Field(default="openai", description="LLM Provider")
-    model: Optional[str] = Field(default=None, description="模型名")
+    provider: str = Field(default="openai", description="LLM Provider: openai / anthropic / custom")
+    model: Optional[str] = Field(default=None, description="模型名，支持自由输入")
+    base_url: Optional[str] = Field(default=None, description="自定义 API 地址，如 https://api.deepseek.com/v1")
     top_k: int = Field(default=5, ge=1, le=20, description="检索Top-K")
 
 

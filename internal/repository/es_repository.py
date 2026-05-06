@@ -45,6 +45,7 @@ class ESRepository:
         return self.client
 
     def is_connected(self) -> bool:
+        """检查 ES 是否连通（3秒超时）"""
         try:
             if self.client is None:
                 self.client = Elasticsearch(
@@ -52,7 +53,9 @@ class ESRepository:
                     request_timeout=3,
                 )
             return self.client.ping()
-        except Exception:
+        except Exception as e:
+            self.logger.warn("health", "es_repository",
+                             "ES 连接检查失败", error=str(e)[:100])
             return False
 
     # ---------- 索引操作 ----------
@@ -97,12 +100,26 @@ class ESRepository:
         es = self.connect()
         return es.indices.exists(index=index_name or self.index)
 
-    # ---------- 数据写入 ----------
+    def _ensure_correct_mapping(self):
+        """
+        确保索引存在。不自动删已有数据——拿到旧 mapping 时走兼容路径。
+        面试点：为什么不一刀切重建？
+        答：用户已有数据不能随便丢，兼容处理比强制清空更负责任。
+        """
+        if not self.index_exists():
+            self.create_index()
     def bulk_insert(self, chunks: List[Dict], vectors: np.ndarray) -> int:
         """
         批量写入 - 面试点：为什么用 bulk 而不是逐条 index？
         答：HTTP 开销大，bulk 批量写入效率高 10-100 倍
+
+        面试点：为什么写入前要确保索引存在？
+        答：ES auto_create_index 会用动态 mapping，导致 file_name 变 text 类型、
+            vector 维度未知，后续聚合查询和向量检索都会报错。
         """
+        # 确保索引以正确的 mapping 存在（防止 auto_create 用错 mapping）
+        self._ensure_correct_mapping()
+
         es = self.connect()
         actions = []
         index = self.index
@@ -128,6 +145,9 @@ class ESRepository:
         if failed:
             self.logger.warn("bulk_insert", "es_repository",
                              f"批量写入部分失败: {len(failed)}条")
+
+        # 强制刷新，让新数据立即可搜索
+        es.indices.refresh(index=index)
         return success
 
     # ---------- 数据检索 ----------
@@ -195,30 +215,51 @@ class ESRepository:
     # ---------- 数据管理 ----------
     def delete_by_file_name(self, file_name: str) -> int:
         """
-        按文件名删除所有 chunk - 面试点：为什么用 delete_by_query？
-        答：一条请求删除所有关联 chunk，原子性有保证
+        按文件名删除所有 chunk
         """
         es = self.connect()
+        agg_field = self._get_agg_field("file_name")
         body = {
             "query": {
-                "term": {"file_name": file_name}
+                "term": {agg_field: file_name}
             }
         }
         response = es.delete_by_query(index=self.index, body=body,
                                        conflicts="proceed")
         return response.get("deleted", 0)
 
+    def _get_agg_field(self, field_name: str) -> str:
+        """探明 ES 实际聚合字段名：keyword 用原名，text 用 .keyword 子字段"""
+        try:
+            es = self.connect()
+            mapping = es.indices.get_mapping(index=self.index)
+            props = mapping.get(self.index, {}).get("mappings", {}).get("properties", {})
+            ftype = props.get(field_name, {}).get("type", "keyword")
+            if ftype == "text":
+                return f"{field_name}.keyword"
+            return field_name
+        except Exception:
+            return field_name  # fallback
+
     def list_file_names(self) -> List[Dict]:
         """
-        列出所有文档及 chunk 数量 - 面试点：在 ES 端聚合，不拉全量数据
+        列出所有文档及 chunk 数量
+        兼容两种 mapping：keyword 字段用 file_name，text 字段用 file_name.keyword
         """
+        if not self.index_exists():
+            return []
+
         es = self.connect()
+
+        # 先搞清楚 field 名：新索引 keyword → file_name，旧索引 text → file_name.keyword
+        agg_field = self._get_agg_field("file_name")
+
         body = {
             "size": 0,
             "aggs": {
                 "documents": {
                     "terms": {
-                        "field": "file_name",
+                        "field": agg_field,
                         "size": 100
                     },
                     "aggs": {
@@ -253,6 +294,8 @@ class ESRepository:
 
     def count(self) -> Dict:
         """返回索引文档总数"""
+        if not self.index_exists():
+            return {"total": 0}
         es = self.connect()
         return {"total": es.count(index=self.index)["count"]}
 

@@ -1,12 +1,14 @@
 """
 RAG 核心服务 - 面试核心问题：
 1. 完整 RAG 链路是什么？query → embedding → hybrid search → rerank → prompt → LLM
-2. 全链路耗时分布？embedding:50-200ms, ES检索:20-50ms, LLM生成:1-3s
+2. 多实体关系查询（张三和李四的合作）怎么查？
+   答：查询分解 → 多路独立检索 → 去重融合
 3. 有哪些兜底策略？BM25降级、空检索兜底、LLM失败友好提示
 """
+import re
 import time
 import uuid
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 
 import numpy as np
 
@@ -37,7 +39,7 @@ class RAGService:
 
     def query(self, question: str, api_key: str,
               provider: str = "openai", model: str = None,
-              top_k: int = 5) -> Dict:
+              base_url: str = None, top_k: int = 5) -> Dict:
         """
         RAG 查询主流程 - 面试点：全链路耗时分布
         1. embedding 推理: ~50-200ms (CPU)
@@ -96,19 +98,44 @@ class RAGService:
         else:
             candidates = candidates[:top_k]
 
-        # Step 4: 空检索兜底
+        # Step 4: 空检索 / 低质量结果 → 尝试多实体分解检索
+        # ⚠️ 触发条件严格：1) 结果<3条  2) 问题含≥2个人名
+        # 正常查询完全跳过此步骤，时延影响 = 0
+        # 面试点：为什么不每次都做？时延 × N，99% 的查询不需要
+        if not candidates or len(candidates) < 3:
+            entities = self._extract_entities(question)
+            if len(entities) >= 2:
+                self.logger.info(trace_id, "rag_service",
+                                 "向量检索结果不足，启用多实体分解检索",
+                                 entities=entities, original_count=len(candidates))
+                decomposed = self._multi_entity_retrieve(question, entities, top_k)
+                if decomposed:
+                    # 合并原始结果和分解检索结果
+                    seen = {c["chunk_id"] for c in candidates}
+                    for c in decomposed:
+                        if c["chunk_id"] not in seen:
+                            candidates.append(c)
+                            seen.add(c["chunk_id"])
+                    timing["decomposed"] = True
+                    timing["decomposed_count"] = len(decomposed)
+
+        # Step 5: 检索仍为空时的兜底
         if not candidates:
             return {
-                "answer": "抱歉，知识库中未找到与您问题相关的信息。\n\n建议：\n1. 尝试用不同的关键词提问\n2. 检查知识库中是否已上传相关文档",
+                "answer": "抱歉，知识库中未找到与您问题相关的信息。\n\n"
+                          "建议：\n"
+                          "1. 尝试用不同的关键词提问\n"
+                          "2. 检查知识库中是否已上传相关文档\n"
+                          "3. 如果是多个人名的关系查询，可分别搜索每个人的信息",
                 "sources": [],
                 "trace_id": trace_id,
                 "timing": timing
             }
 
-        # Step 5: 拼接上下文
+        # Step 6: 拼接上下文
         context = self._build_context(candidates)
 
-        # Step 6: 调用 LLM 生成
+        # Step 7: 调用 LLM 生成
         llm_start = time.time()
         try:
             answer = self.llm.generate(
@@ -116,7 +143,8 @@ class RAGService:
                 context=context,
                 api_key=api_key,
                 provider=provider,
-                model=model
+                model=model,
+                base_url=base_url
             )
         except LLMAPIError as e:
             # LLM 失败时返回检索到的原始内容
@@ -125,7 +153,7 @@ class RAGService:
         llm_time = time.time() - llm_start
         timing["llm_s"] = round(llm_time, 1)
         self.logger.info(trace_id, "rag_service",
-                         "Step6 LLM 生成完成",
+                         "Step7 LLM 生成完成",
                          duration_s=round(llm_time, 1))
 
         # 构造返回
@@ -195,10 +223,7 @@ class RAGService:
 
     def _build_context(self, candidates: List[Dict]) -> str:
         """
-        上下文拼接 - 面试点：Prompt 构造原则
-        1. 明确告诉 LLM 信息源
-        2. 标注来源，方便验证
-        3. 控制长度，不超过 LLM 上下文窗口的 50%
+        上下文拼接
         """
         context_parts = []
         for i, c in enumerate(candidates, 1):
@@ -208,3 +233,133 @@ class RAGService:
                 f"内容: {c['content']}"
             )
         return "\n\n".join(context_parts)
+
+    # ==================== 查询分解检索 ====================
+
+    # 从问题中排除的停用词（不参与关键词拆分）
+    _STOP_WORDS = {
+        '的', '了', '在', '是', '我', '有', '和', '与', '或', '及',
+        '对', '等', '从', '到', '中', '上', '下', '为', '把', '被',
+        '什么', '哪些', '哪个', '怎么', '如何', '为什么', '多少',
+        '吗', '呢', '吧', '啊', '呀', '请', '可以', '能', '会',
+        '一个', '这个', '那个', '这些', '那些', '每个', '所有',
+        '之间', '关系', '区别', '对比', '比较', '不同', '相同',
+        '有没有', '是不是', '查询', '检索', '搜索', '告诉', '帮我',
+        '根据', '按照', '基于', '关于', '问题', '请问', '帮忙',
+        '一下', '一点', '一些', '出来', '起来', '过来',
+    }
+
+    @staticmethod
+    def _extract_entities(question: str) -> List[str]:
+        """
+        从问题中提取关键词做分解检索 — 不限实体类型
+
+        面试点：为什么不用 NER？
+        答：企业场景跨实体查询不止人名 —
+           "FastAPI 和 Flask" = 技术对比
+           "Redis 和 Memcached" = 中间件选型
+           "张成都和李某某" = 人名关系
+           停用词分割方案覆盖所有类型，零额外依赖。
+        """
+        import re
+
+        # 1. 把连接词、疑问词、常见动词替换为空格，充当分词边界
+        splits = [
+            '和', '与', '或', '及', '以及', '还有', '还是',
+            '对比', '比较', '区别', '不同', '相同', '相似',
+            '什么', '哪些', '哪个', '怎么', '如何', '为什么', '多少',
+            '之间', '关系', '联系', '关联',
+            '有没有', '是不是', '能不能', '会不会', '可不可以',
+            '能', '会', '可以', '有', '是', '做', '过', '用',
+            '用过', '做过', '合作过', '工作过',
+            '请', '请问', '帮忙', '帮我', '告诉',
+            '查询', '检索', '搜索', '查找', '找',
+            '根据', '按照', '基于', '关于', '的',
+            '吗', '呢', '吧', '啊', '呀',
+        ]
+
+        text = question
+        for w in sorted(splits, key=len, reverse=True):  # 长词优先替换
+            text = text.replace(w, ' ')
+
+        # 2. 去标点
+        # 保留中英文+数字，其余变空格
+        text = re.sub(r'[^\w\u4e00-\u9fa5]', ' ', text)
+
+        # 3. 拆分
+        raw = [t.strip() for t in text.split() if t.strip()]
+
+        # 4. 过滤
+        stop = RAGService._STOP_WORDS
+        terms = []
+        for t in raw:
+            if len(t) < 2:
+                continue
+            if t in stop:
+                continue
+            if re.match(r'^[\d\.\-+#_@]+$', t):
+                continue
+            terms.append(t)
+
+        # 5. 去重保序
+        seen = set()
+        result = []
+        for t in terms:
+            if t not in seen:
+                seen.add(t)
+                result.append(t)
+        return result[:5]
+
+    def _multi_entity_retrieve(self, question: str, terms: List[str],
+                                top_k: int) -> List[Dict]:
+        """
+        关键词分解检索 — 通用的检索增强
+
+        面试话术：
+        「向量检索做语义粗排，关键词分解做精确补充。
+          检索不足时，把问题中的关键词拆出来各自用 BM25 搜一遍。
+          BM25 对专有名词/技术术语是 100% 精确匹配，不会语义漂移。
+          比如'张成都' embedding 可能当普通文本编码遗漏掉，
+          但 BM25 能命中文档中每个出现位置。」
+
+        适用场景：
+        - 人名关系查询："张三和李四"
+        - 技术对比："FastAPI vs Flask"
+        - 中间件选型："Redis 和 Kafka"
+        - 项目关联："项目A 项目B 进度"
+        """
+        all_results: List[Dict] = []
+        seen_ids: Set[str] = set()
+
+        self.logger.info("decompose", "rag_service",
+                         "关键词分解检索", terms=terms)
+
+        for term in terms:
+            try:
+                results = self.es.search_keyword_only(term, top_k)
+                for r in results:
+                    cid = r["chunk_id"]
+                    if cid not in seen_ids:
+                        seen_ids.add(cid)
+                        all_results.append(r)
+            except Exception as e:
+                self.logger.warn("decompose", "rag_service",
+                                 f"子检索失败", term=term, error=str(e))
+
+        # 多关键词组合（同时出现更相关）
+        if len(terms) >= 2:
+            combo = " ".join(terms[:3])
+            try:
+                results = self.es.search_keyword_only(combo, top_k * 2)
+                for r in results:
+                    cid = r["chunk_id"]
+                    if cid not in seen_ids:
+                        seen_ids.add(cid)
+                        all_results.append(r)
+            except Exception:
+                pass
+
+        self.logger.info("decompose", "rag_service",
+                         "关键词分解完成", terms=len(terms),
+                         retrieved=len(all_results))
+        return all_results

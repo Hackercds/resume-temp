@@ -34,14 +34,19 @@ class KnowledgeBaseService:
                        chunk_size: int = None,
                        overlap: int = None) -> Dict:
         """
-        文档入库主流程 - 面试点：完整流程是什么？
+        文档入库主流程（同名覆盖策略：先删旧后写新）
+        0. 同名检测 → 删旧 chunks
         1. 解析文档 → 原始文本
         2. 文本分块 → chunks
         3. 批量向量化 → vectors
         4. 写入 ES
-
-        每步都有日志记录，便于排查问题
         """
+        # Step 0: 同名文件覆盖策略（删旧写新，保证幂等）
+        deleted = self.es.delete_by_file_name(file_name)
+        if deleted > 0:
+            self.logger.info("ingest", "knowledge_base",
+                             f"删除同名旧文档: {file_name}", deleted_chunks=deleted)
+
         # Step 1: 解析文档
         text = self.parser.parse(content, file_name)
         if not text or not text.strip():
@@ -86,12 +91,16 @@ class KnowledgeBaseService:
                          "Step4 ES写入完成",
                          file_name=file_name, inserted=inserted)
 
-        return {
+        result = {
             "file_name": file_name,
             "file_type": ext[1:] if ext.startswith('.') else ext,
             "chunks_created": inserted,
             "total_chunks": self.es.count()["total"]
         }
+        if deleted > 0:
+            result["replaced"] = True
+            result["replaced_chunks"] = deleted
+        return result
 
     def ingest_file(self, file_path: str, chunk_size: int = 400,
                     overlap: int = 50) -> Dict:

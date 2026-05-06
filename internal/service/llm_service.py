@@ -32,13 +32,10 @@ class LLMService:
 
     def generate(self, question: str, context: str,
                  api_key: str, provider: str = "openai",
-                 model: str = None) -> str:
+                 model: str = None, base_url: str = None) -> str:
         """
         统一生成接口 - 面试点：Provider 切换只需传参
-        response 格式：
-        - OpenAI:      {"choices": [{"message": {"content": "..."}}]}
-        - Anthropic:   {"content": [{"text": "..."}]}
-        本方法统一提取 answer text
+        base_url: 自定义 API 地址（兼容 DeepSeek / 豆包 / 本地模型等）
         """
         cfg = get_config()
         llm_cfg = cfg.llm
@@ -47,15 +44,26 @@ class LLMService:
         prompt = self._build_prompt(question, context)
 
         if provider == "openai":
-            return self._call_openai(api_key, model, prompt)
+            return self._call_openai(api_key, model, prompt, base_url)
         elif provider == "anthropic":
-            return self._call_anthropic(api_key, model, prompt)
+            return self._call_anthropic(api_key, model, prompt, base_url)
+        elif provider == "custom":
+            # custom → 用 OpenAI 兼容协议 + 自定义 base_url
+            return self._call_openai(api_key, model, prompt, base_url)
         else:
-            raise LLMAPIError(f"不支持的 Provider: {provider}")
+            raise LLMAPIError(f"不支持的 Provider: {provider}，可选 openai / anthropic / custom")
 
-    def _call_openai(self, api_key: str, model: str, prompt: str) -> str:
-        """OpenAI API 调用"""
-        url = "https://api.openai.com/v1/chat/completions"
+    def _call_openai(self, api_key: str, model: str, prompt: str,
+                     base_url: str = None) -> str:
+        """
+        OpenAI 兼容 API 调用
+        base_url: 自定义 API 地址，如 https://api.deepseek.com/v1
+                  不传则用 OpenAI 官方地址
+        """
+        if base_url:
+            url = base_url.rstrip("/") + "/chat/completions"
+        else:
+            url = "https://api.openai.com/v1/chat/completions"
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -95,9 +103,13 @@ class LLMService:
         except Exception as e:
             raise LLMAPIError(f"API 调用异常: {str(e)}")
 
-    def _call_anthropic(self, api_key: str, model: str, prompt: str) -> str:
+    def _call_anthropic(self, api_key: str, model: str, prompt: str,
+                         base_url: str = None) -> str:
         """Anthropic API 调用"""
-        url = "https://api.anthropic.com/v1/messages"
+        if base_url:
+            url = base_url.rstrip("/") + "/messages"
+        else:
+            url = "https://api.anthropic.com/v1/messages"
         headers = {
             "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
