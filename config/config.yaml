@@ -1,0 +1,52 @@
+app:
+  name: "resume-rag-service"
+  host: "0.0.0.0"
+  port: 8080
+  mode: "release"
+
+log:
+  level: "info"
+  path: "./log"
+  filename: "app.log"
+  maxSize: 100
+  maxBackups: 30
+  maxAge: 7
+  compress: true
+
+elasticsearch:
+  hosts:
+    - "http://localhost:9200"
+  index: "pdf_knowledge_base"
+  vector_dim: 1024
+  request_timeout: 30
+
+embedding:
+  model_name: "BAAI/bge-small-zh-v1.5"
+  cache_folder: "./models"
+  max_concurrent: 4
+  batch_size: 32
+
+chunk:
+  chunk_size: 400
+  overlap: 50
+
+llm:
+  default_provider: "openai"
+  default_model: "gpt-4o-mini"
+  timeout: 60
+  temperature: 0.3
+  max_tokens: 1000
+
+rerank:
+  enabled: false
+  model_name: "cross-encoder/ms-marco-MiniLM-L-6V2"
+
+retrieval:
+  top_k: 5
+  min_score: 0.5
+
+cors:
+  allowed_origins:
+    - "http://localhost:5000"
+    - "http://192.168.3.184:5000"
+    - "http://127.0.0.1:5000"

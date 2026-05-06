@@ -1,0 +1,6 @@
+{
+  "name": "resume-rag-frontend",
+  "version": "1.0.0",
+  "description": "简历 RAG 智能问答系统 - Vue3 前端",
+  "private": true
+}

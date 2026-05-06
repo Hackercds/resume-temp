@@ -1,0 +1,122 @@
+"""
+配置加载模块 - 面试点：配置优先级 环境变量 > config.yaml > 默认值
+遵循 MICRO_SERVICE_SPEC.md 规范：所有配置通过 config.yaml 注入，禁止硬编码
+"""
+import os
+import yaml
+from typing import List, Optional
+from pydantic import BaseModel
+
+
+class AppConfig(BaseModel):
+    name: str = "resume-rag-service"
+    host: str = "0.0.0.0"
+    port: int = 8080
+    mode: str = "release"
+
+
+class LogConfig(BaseModel):
+    level: str = "info"
+    path: str = "./log"
+    filename: str = "app.log"
+    maxSize: int = 100
+    maxBackups: int = 30
+    maxAge: int = 7
+    compress: bool = True
+
+
+class ElasticsearchConfig(BaseModel):
+    hosts: List[str] = ["http://localhost:9200"]
+    index: str = "pdf_knowledge_base"
+    vector_dim: int = 1024
+    request_timeout: int = 30
+
+
+class EmbeddingConfig(BaseModel):
+    model_name: str = "BAAI/bge-small-zh-v1.5"
+    cache_folder: str = "./models"
+    max_concurrent: int = 4
+    batch_size: int = 32
+
+
+class ChunkConfig(BaseModel):
+    chunk_size: int = 400
+    overlap: int = 50
+
+
+class LLMConfig(BaseModel):
+    default_provider: str = "openai"
+    default_model: str = "gpt-4o-mini"
+    timeout: int = 60
+    temperature: float = 0.3
+    max_tokens: int = 1000
+
+
+class RerankConfig(BaseModel):
+    enabled: bool = False
+    model_name: str = "cross-encoder/ms-marco-MiniLM-L-6V2"
+
+
+class RetrievalConfig(BaseModel):
+    top_k: int = 5
+    min_score: float = 0.5
+
+
+class CorsConfig(BaseModel):
+    allowed_origins: List[str] = ["http://localhost:5000"]
+
+
+class Config(BaseModel):
+    app: AppConfig = AppConfig()
+    log: LogConfig = LogConfig()
+    elasticsearch: ElasticsearchConfig = ElasticsearchConfig()
+    embedding: EmbeddingConfig = EmbeddingConfig()
+    chunk: ChunkConfig = ChunkConfig()
+    llm: LLMConfig = LLMConfig()
+    rerank: RerankConfig = RerankConfig()
+    retrieval: RetrievalConfig = RetrievalConfig()
+    cors: CorsConfig = CorsConfig()
+
+
+def load_config(config_path: str = "config/config.yaml") -> Config:
+    """加载配置：config.yaml 为底，环境变量覆盖"""
+    config_data = {}
+
+    # 1. 加载 YAML 文件
+    if os.path.exists(config_path):
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config_data = yaml.safe_load(f) or {}
+
+    # 2. 环境变量覆盖（遵循 ${ENV_VAR} 规范）
+    # ES_HOST → elasticsearch.hosts[0]
+    if os.getenv("ES_HOST"):
+        config_data.setdefault("elasticsearch", {}).setdefault("hosts", [])
+        config_data["elasticsearch"]["hosts"][0] = os.getenv("ES_HOST")
+    if os.getenv("ES_INDEX"):
+        config_data.setdefault("elasticsearch", {})["index"] = os.getenv("ES_INDEX")
+    if os.getenv("APP_PORT"):
+        config_data.setdefault("app", {})["port"] = int(os.getenv("APP_PORT"))
+    if os.getenv("APP_MODE"):
+        config_data.setdefault("app", {})["mode"] = os.getenv("APP_MODE")
+    if os.getenv("LOG_LEVEL"):
+        config_data.setdefault("log", {})["level"] = os.getenv("LOG_LEVEL")
+
+    return Config(**config_data)
+
+
+# 全局配置实例（进程级单例）
+_config: Optional[Config] = None
+
+
+def get_config() -> Config:
+    global _config
+    if _config is None:
+        _config = load_config()
+    return _config
+
+
+def reload_config(config_path: str = "config/config.yaml") -> Config:
+    """重新加载配置（模型更新等场景）"""
+    global _config
+    _config = load_config(config_path)
+    return _config

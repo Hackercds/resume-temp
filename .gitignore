@@ -1,0 +1,43 @@
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Environment
+.env
+.env.local
+
+# Logs
+log/
+*.log
+*.log.*
+
+# Models (downloaded at runtime)
+models/
+
+# Uploads
+uploads/
+data/
+
+# Docker
+docker-compose.override.yml
+
+# Sensitive
+*.pem
+*.key
