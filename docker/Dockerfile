@@ -25,11 +25,10 @@ ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
 
-# 代理 + 模型缓存路径（与运行时一致，避免重复下载）
+# 代理（pip + huggingface 下载走代理）
 ENV HTTP_PROXY=${HTTP_PROXY} \
     HTTPS_PROXY=${HTTPS_PROXY} \
-    NO_PROXY=${NO_PROXY} \
-    SENTENCE_TRANSFORMERS_HOME=/build/models
+    NO_PROXY=${NO_PROXY}
 
 # ---- Layer 1: 轻量依赖 ----
 COPY requirements-base.txt .
@@ -51,22 +50,38 @@ RUN if [ -n "${HTTP_PROXY}" ]; then \
             -i ${PIP_INDEX} --trusted-host ${PIP_TRUSTED_HOST}; \
     fi
 
-# ---- Layer 3: 预下载 BGE 模型（走 SENTENCE_TRANSFORMERS_HOME 路径）----
-RUN echo ">>> 预下载 BGE-small-zh 模型到 ${SENTENCE_TRANSFORMERS_HOME} ..." && \
-    python -c "import os; p=os.environ.get('HTTP_PROXY',''); print('代理:', p if p else '无'); print('模型路径:', os.environ.get('SENTENCE_TRANSFORMERS_HOME','未设置')); from sentence_transformers import SentenceTransformer; m=SentenceTransformer('BAAI/bge-small-zh-v1.5'); print('下载成功, 维度:', m.get_sentence_embedding_dimension())" \
-    && echo ">>> 模型文件:" && ls -la ${SENTENCE_TRANSFORMERS_HOME}/ \
+# ---- Layer 3: 预下载 BGE 模型（snapshot_download → 显式 local_dir）----
+RUN echo ">>> 预下载 BGE-small-zh 模型..." && \
+    python -c "
+from huggingface_hub import snapshot_download
+import os
+proxy = os.environ.get('HTTP_PROXY','')
+print('代理:', proxy if proxy else '无')
+local = '/build/bge-model'
+print('目标路径:', local)
+snapshot_download('BAAI/bge-small-zh-v1.5', local_dir=local,
+                  local_files_only=False, resume_download=True)
+import glob
+files = glob.glob(local + '/**', recursive=True)
+print(f'下载文件数: {len(files)}')
+for f in ['config.json', 'model.safetensors', 'pytorch_model.bin',
+          'tokenizer.json', 'sentence_bert_config.json', 'modules.json']:
+    fp = os.path.join(local, f)
+    if os.path.exists(fp):
+        print(f'  ✓ {f} ({os.path.getsize(fp)} bytes)')
+    else:
+        print(f'  ✗ {f} 缺失!')
+" \
+    && echo ">>> 模型预下载完成" \
     || echo ">>> [WARN] 模型预下载失败，首次请求时将自动下载（可能需要几十秒）"
 
 # ============================================================
 FROM python:3.11-slim
 WORKDIR /app
 
-# sentence-transformers 模型查找路径（与 config.yaml 中 cache_folder 一致）
-ENV SENTENCE_TRANSFORMERS_HOME=/app/models
-
-# 复制 Python 包 + 预下载模型
+# 复制 Python 包 + 预下载模型（显式 local_dir，不依赖缓存魔法）
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
-COPY --from=builder /build/models /app/models
+COPY --from=builder /build/bge-model /app/models/bge-model
 
 # 应用代码
 COPY main.py .

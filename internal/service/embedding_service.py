@@ -38,27 +38,76 @@ class EmbeddingService:
 
     def load_model(self):
         """
-        模型加载 - 面试点：首次加载慢（~10-30s），如何优化？
-        - 启动时后台线程预热
-        - 模型文件持久化到本地磁盘
-        - Docker 构建时预下载（COPY 到镜像内）
+        模型加载 — 优先本地路径，找不到再下载。DEBUG 日志打印完整诊断。
         """
         if self.model is not None:
+            self.logger.debug("load_model", "embedding", "模型已加载，跳过")
             return
 
         try:
             from sentence_transformers import SentenceTransformer
+            import os
+            import glob
 
-            # 自动检测设备：GPU > CPU
+            self.logger.debug("load_model", "embedding",
+                              "===== 模型加载诊断 =====",
+                              cache_folder=self.cache_folder,
+                              model_name=self.model_name,
+                              cwd=os.getcwd(),
+                              abs_cache=os.path.abspath(self.cache_folder))
+
+            # 自动检测设备
             try:
                 import torch
                 device = "cuda" if torch.cuda.is_available() else "cpu"
             except ImportError:
                 device = "cpu"
+            self.logger.debug("load_model", "embedding",
+                              "设备检测", device=device)
+
+            # 优先用 Docker 预下载的本地模型
+            local_path = os.path.join(self.cache_folder, "bge-model")
+            abs_local = os.path.abspath(local_path)
+            self.logger.debug("load_model", "embedding",
+                              "检查本地模型路径",
+                              path=abs_local,
+                              exists=os.path.isdir(abs_local))
+
+            if os.path.isdir(abs_local):
+                # 列出路径下的文件
+                try:
+                    top_files = os.listdir(abs_local)[:20]
+                    self.logger.debug("load_model", "embedding",
+                                      "本地路径内容", files=top_files)
+                except Exception:
+                    pass
+
+                # 检查关键文件
+                for fname in ['config.json', 'model.safetensors', 'pytorch_model.bin',
+                               'tokenizer.json', 'sentence_bert_config.json']:
+                    fp = os.path.join(abs_local, fname)
+                    exists = os.path.isfile(fp)
+                    size = os.path.getsize(fp) if exists else 0
+                    self.logger.debug("load_model", "embedding",
+                                      f"  关键文件: {fname}",
+                                      exists=exists, size=size)
+
+            if os.path.isdir(abs_local) and os.path.isfile(os.path.join(abs_local, "config.json")):
+                model_source = abs_local
+                self.logger.info("load_model", "embedding",
+                                 "✓ 使用预下载本地模型", path=abs_local)
+            else:
+                model_source = self.model_name
+                self.logger.info("load_model", "embedding",
+                                 "本地模型不可用，从 HuggingFace 下载",
+                                 model=self.model_name,
+                                 reason="本地路径不存在或缺少 config.json")
 
             start = time.time()
+            self.logger.debug("load_model", "embedding",
+                              "开始加载模型...", source=str(model_source)[:80])
             self.model = SentenceTransformer(
-                self.model_name,
+                model_source,
                 device=device,
                 cache_folder=self.cache_folder
             )

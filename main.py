@@ -41,11 +41,14 @@ async def lifespan(app: FastAPI):
     # 后台预热 embedding 模型
     try:
         from internal.service.embedding_service import get_embedding_service
+        import threading, os
         emb_service = get_embedding_service()
-        import threading
+        logger.info(trace_id, "main",
+                    "Embedding 模型预热中（后台线程）",
+                    model=cfg.embedding.model_name,
+                    cache=cfg.embedding.cache_folder,
+                    log_level=cfg.log.level)
         threading.Thread(target=lambda: emb_service.load_model(), daemon=True).start()
-        logger.info(trace_id, "main", "Embedding 模型预热中（后台线程）",
-                    model=cfg.embedding.model_name)
     except Exception as e:
         logger.warn(trace_id, "main", "Embedding 模型预热失败，首次请求时加载",
                     error=str(e))
