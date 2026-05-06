@@ -22,9 +22,14 @@ health:
 	@echo -n "Frontend: "; curl -sf -o /dev/null -w "%{http_code}" http://localhost:$(FRONTEND_PORT) && echo "" || echo " FAILED"
 
 docker-build:
+	@if [ -n "${HTTP_PROXY}" ]; then \
+		echo ">>> 使用代理: ${HTTP_PROXY}"; \
+	fi
 	docker build \
 		--build-arg PIP_INDEX=${PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple} \
 		--build-arg PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST:-pypi.tuna.tsinghua.edu.cn} \
+		--build-arg HTTP_PROXY=${HTTP_PROXY:-} \
+		--build-arg HTTPS_PROXY=${HTTPS_PROXY:-} \
 		-t $(APP_NAME)-backend:latest -f docker/Dockerfile .
 	docker build -t $(APP_NAME)-frontend:latest -f docker/Dockerfile.frontend .
 

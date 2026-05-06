@@ -3,14 +3,14 @@ pipeline {
 
     // ============================================================
     // 参数说明：
-    //   SKIP_ES=true → 不启动 ES 容器，使用外部 ES_HOST
+    //   SKIP_ES=true → 不启动 ES 容器，使用外部 ES_HOSTe
     //   端口冲突时 → 修改 BACKEND_PORT / FRONTEND_PORT / ES_PORT
     //   所有默认端口与 docker-compose.yml / deploy.sh 保持一致
     // ============================================================
     parameters {
-        booleanParam(name: 'SKIP_ES', defaultValue: false,
+        booleanParam(name: 'SKIP_ES', defaultValue: true,
                      description: '已有 ES 时选 true，不启动 ES 容器。端口不会被占用。')
-        string(name: 'ES_HOST', defaultValue: 'http://elasticsearch:9200',
+        string(name: 'ES_HOST', defaultValue: 'http://maco.hackercd.cn:9200',
                description: 'ES 地址。SKIP_ES=true 时填外部实际地址，容器内走弹性网络。')
         string(name: 'BACKEND_PORT', defaultValue: '8080',
                description: '后端主机端口（避免与已有服务冲突可改为 9090 等）')
@@ -18,9 +18,9 @@ pipeline {
                description: '前端主机端口')
         string(name: 'ES_PORT', defaultValue: '9200',
                description: 'ES 主机端口。SKIP_ES=true 时忽略此参数')
-        string(name: 'DEPLOY_HOST', defaultValue: '',
+        string(name: 'DEPLOY_HOST', defaultValue: 'maco.hackercd.cn',
                description: '部署目标 IP（留空 = localhost）')
-        string(name: 'DOCKER_HOST_URI', defaultValue: '',
+        string(name: 'DOCKER_HOST_URI', defaultValue: 'tcp://192.168.3.188:2375',
                description: '远程 Docker TCP 地址，如 tcp://192.168.3.188:2375。留空 = 本地 Docker。')
     }
 
@@ -34,6 +34,8 @@ pipeline {
         CN_FRONTEND = 'rag-frontend'
         // 有外部 DOCKER_HOST 时才设置
         DOCKER_HOST = "${params.DOCKER_HOST_URI}"
+        HTTP_PROXY = 'http://192.168.3.2:20172'
+        //这个http_proxy是因为，我这边下载huggingface模型的原因，你们可以去掉的，另外就是国内的话modelscope也挺好
     }
 
     stages {
@@ -60,15 +62,23 @@ pipeline {
                     docker pull ${PROJECT_NAME}-backend:latest 2>/dev/null || true
                     docker pull ${PROJECT_NAME}-frontend:latest 2>/dev/null || true
 
-                    # 镜像源：清华(默认)/aliyun/中科大/华为，哪个快用哪个
-                    # Jenkins 构建时加 --build-arg PIP_INDEX=xxx 即可切换
+                    # 镜像源 + 代理（Jenkins 环境变量或参数传入）
                     PIP_MIRROR="${PIP_MIRROR:-https://pypi.tuna.tsinghua.edu.cn/simple}"
                     PIP_HOST="${PIP_HOST:-pypi.tuna.tsinghua.edu.cn}"
+                    HTTP_PROXY="${HTTP_PROXY:-}"
 
-                    echo ">>> 构建后端（镜像: ${PIP_MIRROR}）"
+                    # 构造代理 --build-arg
+                    PROXY_ARGS=""
+                    if [ -n "${HTTP_PROXY}" ]; then
+                        echo ">>> 使用代理: ${HTTP_PROXY}"
+                        PROXY_ARGS="--build-arg HTTP_PROXY=${HTTP_PROXY} --build-arg HTTPS_PROXY=${HTTP_PROXY}"
+                    fi
+
+                    echo ">>> 构建后端（镜像: ${PIP_MIRROR}, 代理: ${HTTP_PROXY:-无}）"
                     docker build \
                         --build-arg PIP_INDEX="${PIP_MIRROR}" \
                         --build-arg PIP_TRUSTED_HOST="${PIP_HOST}" \
+                        ${PROXY_ARGS} \
                         --cache-from ${PROJECT_NAME}-backend:latest \
                         -t ${PROJECT_NAME}-backend:${BUILD_NUMBER} \
                         -t ${PROJECT_NAME}-backend:latest \

@@ -21,7 +21,7 @@ log:
 
 elasticsearch:
   hosts:
-    - "http://localhost:9200"   # 默认本地。Docker 内用 http://elasticsearch:9200（ES_HOST 环境变量覆盖）
+    - "http://maco.hackercd.cn:9200"   # 默认本地,但是我要用先在我自己的环境部署一下，你们用的时候自己改自己的环境。Docker 内用 http://elasticsearch:9200（ES_HOST 环境变量覆盖）
   index: "pdf_knowledge_base"
   vector_dim: 512              # BGE-small-zh-v1.5 实际输出 512 维
   request_timeout: 30
