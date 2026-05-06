@@ -50,30 +50,12 @@ RUN if [ -n "${HTTP_PROXY}" ]; then \
             -i ${PIP_INDEX} --trusted-host ${PIP_TRUSTED_HOST}; \
     fi
 
-# ---- Layer 3: 预下载 BGE 模型（snapshot_download → 显式 local_dir）----
+# ---- Layer 3: 预下载 BGE 模型（脚本文件，避免 Docker 多行解析问题）----
+COPY docker/download_model.py /tmp/download_model.py
 RUN echo ">>> 预下载 BGE-small-zh 模型..." && \
-    python -c "
-from huggingface_hub import snapshot_download
-import os
-proxy = os.environ.get('HTTP_PROXY','')
-print('代理:', proxy if proxy else '无')
-local = '/build/bge-model'
-print('目标路径:', local)
-snapshot_download('BAAI/bge-small-zh-v1.5', local_dir=local,
-                  local_files_only=False, resume_download=True)
-import glob
-files = glob.glob(local + '/**', recursive=True)
-print(f'下载文件数: {len(files)}')
-for f in ['config.json', 'model.safetensors', 'pytorch_model.bin',
-          'tokenizer.json', 'sentence_bert_config.json', 'modules.json']:
-    fp = os.path.join(local, f)
-    if os.path.exists(fp):
-        print(f'  ✓ {f} ({os.path.getsize(fp)} bytes)')
-    else:
-        print(f'  ✗ {f} 缺失!')
-" \
-    && echo ">>> 模型预下载完成" \
-    || echo ">>> [WARN] 模型预下载失败，首次请求时将自动下载（可能需要几十秒）"
+    python /tmp/download_model.py && \
+    echo ">>> 模型预下载完成" && ls -lh /build/bge-model/ | head -10 \
+    || echo ">>> [WARN] 模型预下载失败，首次请求时将自动下载"
 
 # ============================================================
 FROM python:3.11-slim
