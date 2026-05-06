@@ -11,7 +11,7 @@ app:
   mode: "release"       # dev 模式自动开启热重载 + CORS *
 
 log:
-  level: "info"
+  level: "debug"
   path: "./log"
   filename: "app.log"
   maxSize: 100
