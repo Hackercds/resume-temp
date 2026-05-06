@@ -20,8 +20,8 @@ pipeline {
                description: 'ES 主机端口。SKIP_ES=true 时忽略此参数')
         string(name: 'DEPLOY_HOST', defaultValue: '',
                description: '部署目标 IP（留空 = localhost）')
-        string(name: 'DOCKER_HOST_URI', defaultValue: '',
-               description: 'Docker TCP 地址，如 tcp://192.168.3.184:2375（留空 = 本地 Docker）')
+        string(name: 'DOCKER_HOST_URI', defaultValue: 'tcp://maco.hackercd.cn:2375',
+               description: 'Docker TCP 地址，如 tcp://192.168.3.188:2375（留空 = 本地 Docker）')
     }
 
     environment {
