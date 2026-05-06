@@ -41,12 +41,12 @@ RUN if [ -n "${HTTP_PROXY}" ]; then \
     fi
 
 # ---- Layer 2: ML 依赖（torch/sentence-transformers ~2GB）----
-COPY requirements.txt .
+COPY requirements-ml.txt .
 RUN if [ -n "${HTTP_PROXY}" ]; then \
-        pip install --proxy "${HTTP_PROXY}" --no-cache-dir -r requirements.txt \
+        pip install --proxy "${HTTP_PROXY}" --no-cache-dir -r requirements-ml.txt \
             -i ${PIP_INDEX} --trusted-host ${PIP_TRUSTED_HOST}; \
     else \
-        pip install --no-cache-dir -r requirements.txt \
+        pip install --no-cache-dir -r requirements-ml.txt \
             -i ${PIP_INDEX} --trusted-host ${PIP_TRUSTED_HOST}; \
     fi
 
