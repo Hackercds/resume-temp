@@ -197,3 +197,6 @@ resume-rag-service/
 - Elasticsearch 8.x（已有或通过 Docker 启动）
 - [可选] Docker（用于容器化部署）
 - [可选] HuggingFace 模型下载（首次运行自动下载 BGE-small-zh，约 500MB）
+<img width="1920" height="1778" alt="image" src="https://github.com/user-attachments/assets/4079d258-0515-4c03-9aa2-86c12f469111" />
+<img width="3115" height="1894" alt="image" src="https://github.com/user-attachments/assets/eb161269-1d19-4363-bdc1-5f24775443bd" />
+
