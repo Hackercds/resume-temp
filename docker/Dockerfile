@@ -1,66 +1,53 @@
 # ============================================================
 # 简历 RAG 智能问答系统 - Docker 镜像
 # ============================================================
-# 多阶段构建，最小化镜像体积
-# 遵循 MICRO_SERVICE_SPEC.md 规范
+# 分层策略：轻量依赖（变化少）→ 重量依赖（ML）→ 源码（变化频）
+# 配合 --cache-from 使 Jenkins 构建时层缓存生效，避免重复下载
 #
-# === 使用方式 ===
-#
-# 1. 构建：
-#    docker build -t resume-rag -f docker/Dockerfile .
-#
-# 2. 启动（连已有 ES）：
-#    docker run -d --name rag \
-#      -p 8080:8080 \
-#      -e ES_HOST=http://你的ES地址:9200 \
-#      resume-rag
-#
-# 3. 启动（需要启动 ES 容器）：
-#    docker network create rag-net
-#    docker run -d --name rag-es --network rag-net --network-alias elasticsearch \
-#      -p 9200:9200 \
-#      -e "discovery.type=single-node" -e "xpack.security.enabled=false" \
-#      docker.elastic.co/elasticsearch/elasticsearch:8.12.0
-#    docker run -d --name rag --network rag-net \
-#      -p 8080:8080 \
-#      -e ES_HOST=http://elasticsearch:9200 \
-#      resume-rag
-#
-# 4. 健康检查：
-#    curl http://localhost:8080/health
-#
-# 5. 修改应用配置：
-#    编辑 config/config.yaml 后重新构建镜像
+# 使用：
+#   docker build -t resume-rag -f docker/Dockerfile .
+#   docker run -d --name rag -p 8080:8080 -e ES_HOST=http://ES地址:9200 resume-rag
 # ============================================================
 
 FROM python:3.11-slim AS builder
 WORKDIR /build
+
+# ---- Layer 1: 轻量依赖（fastapi/es 等，几乎不变 → 层缓存）----
+COPY requirements-base.txt .
+RUN pip install --no-cache-dir -r requirements-base.txt \
+    -i https://mirrors.aliyun.com/pypi/simple/ \
+    --trusted-host mirrors.aliyun.com
+
+# ---- Layer 2: 重量 ML 依赖（torch/sentence-transformers）----
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
     -i https://mirrors.aliyun.com/pypi/simple/ \
     --trusted-host mirrors.aliyun.com
 
+# ---- Layer 3: 预下载 Embedding 模型（避免首次请求等几十秒）----
+RUN python -c "from sentence_transformers import SentenceTransformer; \
+    SentenceTransformer('BAAI/bge-small-zh-v1.5', cache_folder='/build/models')" \
+    2>/dev/null || echo "模型预下载跳过（非关键）"
+
+# ============================================================
 FROM python:3.11-slim
-# 个人展示项目，未使用 digest 锁
 WORKDIR /app
 
 # 从构建阶段复制 Python 包
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 
-# 复制应用代码（config.yaml 在 config/ 目录下，是唯一配置源）
+# 从构建阶段复制预下载的模型
+COPY --from=builder /build/models /app/models
+
+# 复制应用代码
 COPY main.py .
 COPY config/ ./config/
-COPY bin/ ./bin/
 COPY internal/ ./internal/
 COPY frontend/ ./frontend/
 
-# 创建非 root 用户
-RUN useradd -m app && chown -R app:app /app && \
-    chmod +x /app/bin/start.sh 2>/dev/null || true
-
-# 创建运行时目录
-RUN mkdir -p /app/log /app/models /app/uploads && \
-    chown -R app:app /app/log /app/models /app/uploads
+# 非 root 用户
+RUN useradd -m app && chown -R app:app /app
+RUN mkdir -p /app/log /app/uploads && chown -R app:app /app/log /app/uploads
 
 USER app
 EXPOSE 8080

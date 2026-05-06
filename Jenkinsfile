@@ -56,12 +56,22 @@ pipeline {
         stage('镜像构建') {
             steps {
                 sh '''
-                    echo ">>> 构建后端"
-                    docker build -t ${PROJECT_NAME}-backend:${BUILD_NUMBER} \
+                    # 拉取上次镜像做层缓存（不存在也不报错）
+                    docker pull ${PROJECT_NAME}-backend:latest 2>/dev/null || true
+                    docker pull ${PROJECT_NAME}-frontend:latest 2>/dev/null || true
+
+                    echo ">>> 构建后端（--cache-from 复用上次层缓存）"
+                    docker build \
+                        --cache-from ${PROJECT_NAME}-backend:latest \
+                        -t ${PROJECT_NAME}-backend:${BUILD_NUMBER} \
+                        -t ${PROJECT_NAME}-backend:latest \
                         -f docker/Dockerfile .
 
                     echo ">>> 构建前端"
-                    docker build -t ${PROJECT_NAME}-frontend:${BUILD_NUMBER} \
+                    docker build \
+                        --cache-from ${PROJECT_NAME}-frontend:latest \
+                        -t ${PROJECT_NAME}-frontend:${BUILD_NUMBER} \
+                        -t ${PROJECT_NAME}-frontend:latest \
                         -f docker/Dockerfile.frontend .
                 '''
             }
