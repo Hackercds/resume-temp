@@ -50,16 +50,10 @@ RUN if [ -n "${HTTP_PROXY}" ]; then \
             -i ${PIP_INDEX} --trusted-host ${PIP_TRUSTED_HOST}; \
     fi
 
-# ---- Layer 3: 预下载 BGE 模型（走代理，失败时提示但不阻塞构建）----
+# ---- Layer 3: 预下载 BGE 模型（走代理，失败不阻塞构建）----
 RUN echo ">>> 预下载 BGE-small-zh 模型..." && \
-    python -c "
-import os
-proxy = os.environ.get('HTTP_PROXY', '')
-print(f'代理: {proxy if proxy else \"无\"}')
-from sentence_transformers import SentenceTransformer
-m = SentenceTransformer('BAAI/bge-small-zh-v1.5', cache_folder='/build/models')
-print(f'模型下载成功，维度: {m.get_sentence_embedding_dimension()}')
-" || echo ">>> [WARN] 模型预下载失败，首次请求时将自动下载（可能需要几十秒）"
+    python -c "import os; proxy=os.environ.get('HTTP_PROXY',''); print('代理:', proxy if proxy else '无'); from sentence_transformers import SentenceTransformer; m=SentenceTransformer('BAAI/bge-small-zh-v1.5', cache_folder='/build/models'); print('模型下载成功，维度:', m.get_sentence_embedding_dimension())" \
+    || echo ">>> [WARN] 模型预下载失败，首次请求时将自动下载（可能需要几十秒）"
 
 # ============================================================
 FROM python:3.11-slim
