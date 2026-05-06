@@ -2,7 +2,10 @@
  * HTTP 请求封装层
  * 统一处理错误、统一响应格式解析
  */
-const API_BASE = '';  // 同域部署，使用相对路径
+// 自动检测 API 地址：
+//   nginx 代理模式 → 相对路径 ''（同域 /api/ → nginx → backend）
+//   独立前端模式 → 用 ?api= 参数或默认同域
+const API_BASE = '';
 
 class ApiClient {
     /**

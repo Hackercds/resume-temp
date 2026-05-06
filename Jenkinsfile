@@ -20,8 +20,8 @@ pipeline {
                description: 'ES 主机端口。SKIP_ES=true 时忽略此参数')
         string(name: 'DEPLOY_HOST', defaultValue: '',
                description: '部署目标 IP（留空 = localhost）')
-        string(name: 'DOCKER_HOST_URI', defaultValue: 'tcp://maco.hackercd.cn:2375',
-               description: 'Docker TCP 地址，如 tcp://192.168.3.188:2375（留空 = 本地 Docker）')
+        string(name: 'DOCKER_HOST_URI', defaultValue: '',
+               description: '远程 Docker TCP 地址，如 tcp://192.168.3.188:2375。留空 = 本地 Docker。')
     }
 
     environment {
@@ -56,12 +56,19 @@ pipeline {
         stage('镜像构建') {
             steps {
                 sh '''
-                    # 拉取上次镜像做层缓存（不存在也不报错）
+                    # 拉取上次镜像做层缓存
                     docker pull ${PROJECT_NAME}-backend:latest 2>/dev/null || true
                     docker pull ${PROJECT_NAME}-frontend:latest 2>/dev/null || true
 
-                    echo ">>> 构建后端（--cache-from 复用上次层缓存）"
+                    # 镜像源：清华(默认)/aliyun/中科大/华为，哪个快用哪个
+                    # Jenkins 构建时加 --build-arg PIP_INDEX=xxx 即可切换
+                    PIP_MIRROR="${PIP_MIRROR:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+                    PIP_HOST="${PIP_HOST:-pypi.tuna.tsinghua.edu.cn}"
+
+                    echo ">>> 构建后端（镜像: ${PIP_MIRROR}）"
                     docker build \
+                        --build-arg PIP_INDEX="${PIP_MIRROR}" \
+                        --build-arg PIP_TRUSTED_HOST="${PIP_HOST}" \
                         --cache-from ${PROJECT_NAME}-backend:latest \
                         -t ${PROJECT_NAME}-backend:${BUILD_NUMBER} \
                         -t ${PROJECT_NAME}-backend:latest \
@@ -96,6 +103,9 @@ pipeline {
                     sleep 2
 
                     # ---- ES ----
+                    # 健康检查用 IP：远程部署用 DEPLOY_HOST，本地用 localhost
+                    HOST="${DEPLOY_HOST:-localhost}"
+
                     if [ "${SKIP_ES}" = "true" ]; then
                         echo ">>> [SKIP] 跳过 ES，使用外部: ${ES_HOST}"
                         if curl -sf "${ES_HOST}/_cluster/health" 2>/dev/null | grep -q "status"; then
@@ -104,14 +114,7 @@ pipeline {
                             echo "⚠ 无法连接 ${ES_HOST}，请确认后再部署"
                         fi
                     else
-                        echo ">>> 检查端口 ${ES_PORT} 是否冲突"
-                        if ss -tlnp 2>/dev/null | grep -q ":${ES_PORT} " || \
-                           netstat -tlnp 2>/dev/null | grep -q ":${ES_PORT} "; then
-                            echo "⚠ 警告: 端口 ${ES_PORT} 已被占用，请修改 ES_PORT 参数后重试"
-                            exit 1
-                        fi
-
-                        echo ">>> 启动 ES (端口 ${ES_PORT})"
+                        echo ">>> 启动 ES (${HOST}:${ES_PORT})"
                         docker run -d \
                             --name ${CN_ES} \
                             --network ${NETWORK} \
@@ -124,9 +127,9 @@ pipeline {
                             --restart=unless-stopped \
                             docker.elastic.co/elasticsearch/elasticsearch:8.12.0
 
-                        echo ">>> 等待 ES 就绪..."
+                        echo ">>> 等待 ES 就绪 (http://${HOST}:${ES_PORT})"
                         for i in $(seq 1 60); do
-                            if curl -sf http://localhost:${ES_PORT}/_cluster/health 2>/dev/null; then
+                            if curl -sf "http://${HOST}:${ES_PORT}/_cluster/health" 2>/dev/null; then
                                 echo "✓ ES 就绪"
                                 break
                             fi

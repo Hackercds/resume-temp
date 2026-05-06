@@ -15,14 +15,17 @@ dev:
 	APP_MODE=dev python main.py
 
 stop:
-	docker rm -f $(APP_NAME)-es $(APP_NAME)-backend $(APP_NAME)-frontend 2>/dev/null || true
+	docker rm -f rag-es rag-backend rag-frontend 2>/dev/null || true
 
 health:
 	@echo -n "Backend: "; curl -sf http://localhost:$(PORT)/health && echo " OK" || echo " FAILED"
 	@echo -n "Frontend: "; curl -sf -o /dev/null -w "%{http_code}" http://localhost:$(FRONTEND_PORT) && echo "" || echo " FAILED"
 
 docker-build:
-	docker build -t $(APP_NAME)-backend:latest -f docker/Dockerfile .
+	docker build \
+		--build-arg PIP_INDEX=${PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple} \
+		--build-arg PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST:-pypi.tuna.tsinghua.edu.cn} \
+		-t $(APP_NAME)-backend:latest -f docker/Dockerfile .
 	docker build -t $(APP_NAME)-frontend:latest -f docker/Dockerfile.frontend .
 
 docker-run:

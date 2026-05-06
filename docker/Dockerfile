@@ -12,17 +12,20 @@
 FROM python:3.11-slim AS builder
 WORKDIR /build
 
+# 构建时可选切换镜像源：
+#   docker build --build-arg PIP_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple ...
+ARG PIP_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+
 # ---- Layer 1: 轻量依赖（fastapi/es 等，几乎不变 → 层缓存）----
 COPY requirements-base.txt .
 RUN pip install --no-cache-dir -r requirements-base.txt \
-    -i https://mirrors.aliyun.com/pypi/simple/ \
-    --trusted-host mirrors.aliyun.com
+    -i ${PIP_INDEX} --trusted-host ${PIP_TRUSTED_HOST}
 
 # ---- Layer 2: 重量 ML 依赖（torch/sentence-transformers）----
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
-    -i https://mirrors.aliyun.com/pypi/simple/ \
-    --trusted-host mirrors.aliyun.com
+    -i ${PIP_INDEX} --trusted-host ${PIP_TRUSTED_HOST}
 
 # ---- Layer 3: 预下载 Embedding 模型（避免首次请求等几十秒）----
 RUN python -c "from sentence_transformers import SentenceTransformer; \

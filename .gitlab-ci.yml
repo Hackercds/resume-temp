@@ -25,7 +25,11 @@ variables:
   PROJECT_NAME: "resume-rag-service"
   NETWORK: "rag-network"
 
-  # 以下变量可在 GitLab CI/CD Variables 中覆盖
+  # ---- 必须通过 GitLab CI/CD Variables 设置 ----
+  DEPLOY_HOST: ""        # 部署目标 IP（必填！）
+  DOCKER_PORT: "2375"    # Docker TCP 端口
+
+  # ---- 可在 GitLab CI/CD Variables 中覆盖 ----
   BACKEND_PORT: "8080"
   FRONTEND_PORT: "5000"
   ES_PORT: "9200"
@@ -50,8 +54,8 @@ build-backend:
     - until docker info; do sleep 1; done
     - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin 2>/dev/null || true
   script:
-    - docker build -t ${PROJECT_NAME}-backend:${CI_PIPELINE_ID} -f docker/Dockerfile .
-    - docker save ${PROJECT_NAME}-backend:${CI_PIPELINE_ID} | gzip > backend-image.tar.gz
+    - docker build -t rag-backend:${CI_PIPELINE_ID} -f docker/Dockerfile .
+    - docker save rag-backend:${CI_PIPELINE_ID} | gzip > backend-image.tar.gz
   artifacts:
     paths:
       - backend-image.tar.gz
@@ -68,8 +72,8 @@ build-frontend:
   before_script:
     - until docker info; do sleep 1; done
   script:
-    - docker build -t ${PROJECT_NAME}-frontend:${CI_PIPELINE_ID} -f docker/Dockerfile.frontend .
-    - docker save ${PROJECT_NAME}-frontend:${CI_PIPELINE_ID} | gzip > frontend-image.tar.gz
+    - docker build -t rag-frontend:${CI_PIPELINE_ID} -f docker/Dockerfile.frontend .
+    - docker save rag-frontend:${CI_PIPELINE_ID} | gzip > frontend-image.tar.gz
   artifacts:
     paths:
       - frontend-image.tar.gz
@@ -85,9 +89,14 @@ deploy-services:
     - build-backend
     - build-frontend
   before_script:
+    - |
+      if [ -z "${DEPLOY_HOST}" ]; then
+        echo "✗ 错误：DEPLOY_HOST 未设置。请在 GitLab → Settings → CI/CD → Variables 中添加 DEPLOY_HOST"
+        exit 1
+      fi
     - echo "部署目标: ${DOCKER_HOST}"
     - echo "SKIP_ES: ${SKIP_ES}, ES_HOST: ${ES_HOST}"
-    - docker info || (echo "✗ 无法连接目标 Docker" && exit 1)
+    - docker info || (echo "✗ 无法连接目标 Docker，请检查 DEPLOY_HOST 和 DOCKER_PORT" && exit 1)
   script:
     - |
       set -e
@@ -100,9 +109,9 @@ deploy-services:
       docker network create ${NETWORK} 2>/dev/null || true
 
       echo ">>> 停止旧容器"
-      docker rm -f ${PROJECT_NAME}-es \
-                 ${PROJECT_NAME}-backend \
-                 ${PROJECT_NAME}-frontend 2>/dev/null || true
+      docker rm -f rag-es \
+                 rag-backend \
+                 rag-frontend 2>/dev/null || true
       sleep 3
 
       # ========== ES ==========
@@ -116,7 +125,7 @@ deploy-services:
       else
         echo ">>> 启动 Elasticsearch"
         docker run -d \
-          --name ${PROJECT_NAME}-es \
+          --name rag-es \
           --network ${NETWORK} \
           --network-alias elasticsearch \
           -p ${ES_PORT}:9200 \
@@ -140,23 +149,23 @@ deploy-services:
       # ========== 后端 ==========
       echo ">>> 启动后端 (端口: ${BACKEND_PORT})"
       docker run -d \
-        --name ${PROJECT_NAME}-backend \
+        --name rag-backend \
         --network ${NETWORK} \
         --network-alias backend \
         -p ${BACKEND_PORT}:8080 \
         -e ES_HOST=${ES_HOST} \
         -e APP_MODE=release \
         --memory=2g \
-        ${PROJECT_NAME}-backend:${CI_PIPELINE_ID}
+        rag-backend:${CI_PIPELINE_ID}
 
       # ========== 前端 ==========
       echo ">>> 启动前端 (端口: ${FRONTEND_PORT})"
       docker run -d \
-        --name ${PROJECT_NAME}-frontend \
+        --name rag-frontend \
         --network ${NETWORK} \
         -p ${FRONTEND_PORT}:80 \
         --memory=256m \
-        ${PROJECT_NAME}-frontend:${CI_PIPELINE_ID}
+        rag-frontend:${CI_PIPELINE_ID}
 
       echo ">>> 部署完成"
       docker ps --filter "name=${PROJECT_NAME}"
@@ -215,6 +224,6 @@ rollback:
     DOCKER_HOST: "tcp://${DEPLOY_HOST}:${DOCKER_PORT}"
   script:
     - echo ">>> 部署失败，回滚..."
-    - docker rm -f ${PROJECT_NAME}-backend ${PROJECT_NAME}-frontend ${PROJECT_NAME}-es 2>/dev/null || true
+    - docker rm -f rag-backend rag-frontend rag-es 2>/dev/null || true
     - echo "已清理所有容器"
   when: on_failure

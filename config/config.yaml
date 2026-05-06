@@ -21,7 +21,7 @@ log:
 
 elasticsearch:
   hosts:
-    - "http://maco.hackercd.cn:9200"   # Docker 内用 http://elasticsearch:9200
+    - "http://localhost:9200"   # 默认本地。Docker 内用 http://elasticsearch:9200（ES_HOST 环境变量覆盖）
   index: "pdf_knowledge_base"
   vector_dim: 512              # BGE-small-zh-v1.5 实际输出 512 维
   request_timeout: 30
@@ -53,6 +53,8 @@ retrieval:
 
 cors:
   allowed_origins:
-    - "http://localhost:8080"
+    # release 模式下 CORS 严格匹配。dev 模式自动 * 不限制
+    - "http://localhost:8080"     # 后端自带前端面板
+    - "http://localhost:5000"     # 独立前端（compose / nginx）
     - "http://127.0.0.1:8080"
-    - "http://192.168.3.188:8080"
+    - "http://127.0.0.1:5000"

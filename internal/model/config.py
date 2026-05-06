@@ -26,9 +26,9 @@ class LogConfig(BaseModel):
 
 
 class ElasticsearchConfig(BaseModel):
-    hosts: List[str] = ["http://localhost:9200"]
+    hosts: List[str] = ["http://localhost:9200"]  # 默认本地。Docker 内用 -e ES_HOST=http://elasticsearch:9200
     index: str = "pdf_knowledge_base"
-    vector_dim: int = 1024
+    vector_dim: int = 512   # BGE-small-zh-v1.5 = 512，BGE-base = 1024
     request_timeout: int = 30
 
 
@@ -63,7 +63,12 @@ class RetrievalConfig(BaseModel):
 
 
 class CorsConfig(BaseModel):
-    allowed_origins: List[str] = ["http://localhost:5000"]
+    allowed_origins: List[str] = [
+        "http://localhost:8080",
+        "http://localhost:5000",
+        "http://127.0.0.1:8080",
+        "http://127.0.0.1:5000",
+    ]
 
 
 class Config(BaseModel):

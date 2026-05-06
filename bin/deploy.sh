@@ -21,6 +21,11 @@ set -e
 PROJECT_NAME="${PROJECT_NAME:-resume-rag-service}"
 NETWORK="${NETWORK:-rag-network}"
 
+# 容器名（与 docker-compose.yml / Jenkinsfile 统一）
+CN_ES="rag-es"
+CN_BACKEND="rag-backend"
+CN_FRONTEND="rag-frontend"
+
 # 主机侧端口映射（容器内部端口固定）
 BACKEND_PORT="${BACKEND_PORT:-8080}"      # 主机 → 容器:8080
 FRONTEND_PORT="${FRONTEND_PORT:-5000}"    # 主机 → 容器:80
@@ -64,8 +69,8 @@ echo "✓ Docker 连接正常"
 # 2. 构建镜像
 echo ""
 echo ">>> 构建镜像"
-docker build -t ${PROJECT_NAME}-backend:${BUILD_TAG} -f docker/Dockerfile .
-docker build -t ${PROJECT_NAME}-frontend:${BUILD_TAG} -f docker/Dockerfile.frontend .
+docker build -t ${CN_BACKEND}:${BUILD_TAG} -f docker/Dockerfile .
+docker build -t ${CN_FRONTEND}:${BUILD_TAG} -f docker/Dockerfile.frontend .
 
 # 3. 创建网络
 echo ""
@@ -75,9 +80,9 @@ docker network create ${NETWORK} 2>/dev/null || true
 # 4. 停止旧容器
 echo ""
 echo ">>> 停止旧容器"
-docker rm -f ${PROJECT_NAME}-es \
-           ${PROJECT_NAME}-backend \
-           ${PROJECT_NAME}-frontend 2>/dev/null || true
+docker rm -f ${CN_ES} \
+           ${CN_BACKEND} \
+           ${CN_FRONTEND} 2>/dev/null || true
 sleep 2
 
 # 5. 启动 ES（可跳过）
@@ -97,7 +102,7 @@ else
     echo ""
     echo ">>> 启动 Elasticsearch"
     docker run -d \
-        --name ${PROJECT_NAME}-es \
+        --name ${CN_ES} \
         --network ${NETWORK} \
         --network-alias elasticsearch \
         -p ${ES_PORT}:9200 \
@@ -124,7 +129,7 @@ fi
 echo ""
 echo ">>> 启动后端 (主机端口: $BACKEND_PORT)"
 docker run -d \
-    --name ${PROJECT_NAME}-backend \
+    --name ${CN_BACKEND} \
     --network ${NETWORK} \
     --network-alias backend \
     -p ${BACKEND_PORT}:8080 \
@@ -133,18 +138,18 @@ docker run -d \
     -e APP_PORT=8080 \
     --memory=${BACKEND_MEMORY} \
     --restart=unless-stopped \
-    ${PROJECT_NAME}-backend:${BUILD_TAG}
+    ${CN_BACKEND}:${BUILD_TAG}
 
 # 7. 启动前端
 echo ""
 echo ">>> 启动前端 (主机端口: $FRONTEND_PORT)"
 docker run -d \
-    --name ${PROJECT_NAME}-frontend \
+    --name ${CN_FRONTEND} \
     --network ${NETWORK} \
     -p ${FRONTEND_PORT}:80 \
     --memory=256m \
     --restart=unless-stopped \
-    ${PROJECT_NAME}-frontend:${BUILD_TAG}
+    ${CN_FRONTEND}:${BUILD_TAG}
 
 # 8. 健康检查
 echo ""
