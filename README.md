@@ -1,4 +1,4 @@
-# 简历 RAG 智能问答系统
+# 简历上写的 RAG 智能问答系统
 
 > 本地 Embedding + Elasticsearch 混合检索 + 在线 LLM
 >
