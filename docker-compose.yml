@@ -1,0 +1,77 @@
+# 简历 RAG 智能问答系统
+# ============================================
+# 使用方式：
+#   已有 ES → docker-compose up -d backend frontend
+#   全栈    → docker-compose --profile full up -d
+#   指定端口 → cp .env.example .env && 修改端口
+# ============================================
+
+version: '3.8'
+
+services:
+  # ---------- ES（仅 --profile full 时启动）----------
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.12.0
+    container_name: rag-es
+    profiles:
+      - full
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+    ports:
+      - "${ES_PORT:-9200}:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    networks:
+      - rag-network
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9200/_cluster/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ---------- 后端 ----------
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: rag-backend
+    ports:
+      - "${BACKEND_PORT:-8080}:8080"
+    environment:
+      - ES_HOST=${ES_HOST:-http://elasticsearch:9200}
+      - APP_MODE=${APP_MODE:-release}
+      - APP_PORT=8080
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+        required: false
+    networks:
+      - rag-network
+    mem_limit: 2g
+    restart: unless-stopped
+
+  # ---------- 前端 ----------
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+    container_name: rag-frontend
+    ports:
+      - "${FRONTEND_PORT:-5000}:80"
+    depends_on:
+      - backend
+    networks:
+      - rag-network
+    mem_limit: 256m
+    restart: unless-stopped
+
+volumes:
+  es_data:
+
+networks:
+  rag-network:
+    driver: bridge

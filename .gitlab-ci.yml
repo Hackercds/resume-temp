@@ -1,0 +1,220 @@
+# ============================================================
+# 简历 RAG 智能问答系统 - GitLab CI/CD 配置
+# 部署模式：GitLab Runner → 远程 Docker TCP → 本机 Docker
+# ============================================================
+#
+# === 前置准备（在本机执行）===
+#   1. Docker 开启 TCP：
+#      Docker Desktop → Settings → General → ☑ Expose daemon on tcp://localhost:2375
+#      或 dockerd -H tcp://0.0.0.0:2375 -H unix:///var/run/docker.sock
+#
+#   2. GitLab → Settings → CI/CD → Variables：
+#      DEPLOY_HOST    = 192.168.3.184    (本机 IP)
+#      DOCKER_PORT    = 2375             (Docker TCP 端口)
+#      SKIP_ES        = true             (本机已有 ES 时设为 true)
+#      ES_HOST        = http://192.168.3.184:9200  (外部 ES 地址，SKIP_ES=true 时必填)
+#      BACKEND_PORT   = 8080
+#      FRONTEND_PORT  = 5000
+#      ES_PORT        = 9200
+#
+#   3. 已有 ES 场景：
+#      SKIP_ES=true 时不会启动 ES 容器，后端直接连 ES_HOST 指定的地址
+# ============================================================
+
+variables:
+  PROJECT_NAME: "resume-rag-service"
+  NETWORK: "rag-network"
+
+  # 以下变量可在 GitLab CI/CD Variables 中覆盖
+  BACKEND_PORT: "8080"
+  FRONTEND_PORT: "5000"
+  ES_PORT: "9200"
+  SKIP_ES: "false"
+  ES_HOST: "http://elasticsearch:9200"
+
+stages:
+  - build
+  - deploy
+  - verify
+
+# ---------- 构建阶段 ----------
+build-backend:
+  stage: build
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_HOST: "tcp://docker:2376"
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - until docker info; do sleep 1; done
+    - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin 2>/dev/null || true
+  script:
+    - docker build -t ${PROJECT_NAME}-backend:${CI_PIPELINE_ID} -f docker/Dockerfile .
+    - docker save ${PROJECT_NAME}-backend:${CI_PIPELINE_ID} | gzip > backend-image.tar.gz
+  artifacts:
+    paths:
+      - backend-image.tar.gz
+    expire_in: 1h
+
+build-frontend:
+  stage: build
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_HOST: "tcp://docker:2376"
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - until docker info; do sleep 1; done
+  script:
+    - docker build -t ${PROJECT_NAME}-frontend:${CI_PIPELINE_ID} -f docker/Dockerfile.frontend .
+    - docker save ${PROJECT_NAME}-frontend:${CI_PIPELINE_ID} | gzip > frontend-image.tar.gz
+  artifacts:
+    paths:
+      - frontend-image.tar.gz
+    expire_in: 1h
+
+# ---------- 部署阶段 ----------
+deploy-services:
+  stage: deploy
+  image: docker:24-cli
+  variables:
+    DOCKER_HOST: "tcp://${DEPLOY_HOST}:${DOCKER_PORT}"
+  needs:
+    - build-backend
+    - build-frontend
+  before_script:
+    - echo "部署目标: ${DOCKER_HOST}"
+    - echo "SKIP_ES: ${SKIP_ES}, ES_HOST: ${ES_HOST}"
+    - docker info || (echo "✗ 无法连接目标 Docker" && exit 1)
+  script:
+    - |
+      set -e
+
+      echo ">>> 加载镜像"
+      gunzip -c backend-image.tar.gz | docker load
+      gunzip -c frontend-image.tar.gz | docker load
+
+      echo ">>> 创建网络"
+      docker network create ${NETWORK} 2>/dev/null || true
+
+      echo ">>> 停止旧容器"
+      docker rm -f ${PROJECT_NAME}-es \
+                 ${PROJECT_NAME}-backend \
+                 ${PROJECT_NAME}-frontend 2>/dev/null || true
+      sleep 3
+
+      # ========== ES ==========
+      if [ "${SKIP_ES}" = "true" ]; then
+        echo ">>> [SKIP] 不启动 ES 容器，使用外部 ES: ${ES_HOST}"
+        if curl -sf "${ES_HOST}/_cluster/health" 2>/dev/null | grep -q '"status"'; then
+          echo "✓ 外部 ES 连接正常"
+        else
+          echo "⚠ 警告：无法连接到 ${ES_HOST}"
+        fi
+      else
+        echo ">>> 启动 Elasticsearch"
+        docker run -d \
+          --name ${PROJECT_NAME}-es \
+          --network ${NETWORK} \
+          --network-alias elasticsearch \
+          -p ${ES_PORT}:9200 \
+          -e "discovery.type=single-node" \
+          -e "xpack.security.enabled=false" \
+          -e "ES_JAVA_OPTS=-Xms1g -Xmx1g" \
+          --memory=2g \
+          docker.elastic.co/elasticsearch/elasticsearch:8.12.0
+
+        echo ">>> 等待 ES 就绪 (最多 3 分钟)"
+        for i in $(seq 1 60); do
+          if curl -sf http://${DEPLOY_HOST}:${ES_PORT}/_cluster/health 2>/dev/null; then
+            echo "✓ ES 已就绪"
+            break
+          fi
+          echo "等待 ES... ($i/60)"
+          sleep 3
+        done
+      fi
+
+      # ========== 后端 ==========
+      echo ">>> 启动后端 (端口: ${BACKEND_PORT})"
+      docker run -d \
+        --name ${PROJECT_NAME}-backend \
+        --network ${NETWORK} \
+        --network-alias backend \
+        -p ${BACKEND_PORT}:8080 \
+        -e ES_HOST=${ES_HOST} \
+        -e APP_MODE=release \
+        --memory=2g \
+        ${PROJECT_NAME}-backend:${CI_PIPELINE_ID}
+
+      # ========== 前端 ==========
+      echo ">>> 启动前端 (端口: ${FRONTEND_PORT})"
+      docker run -d \
+        --name ${PROJECT_NAME}-frontend \
+        --network ${NETWORK} \
+        -p ${FRONTEND_PORT}:80 \
+        --memory=256m \
+        ${PROJECT_NAME}-frontend:${CI_PIPELINE_ID}
+
+      echo ">>> 部署完成"
+      docker ps --filter "name=${PROJECT_NAME}"
+
+# ---------- 验证阶段 ----------
+verify-deploy:
+  stage: verify
+  image: curlimages/curl:latest
+  needs:
+    - deploy-services
+  script:
+    - |
+      echo ">>> 等待服务就绪"
+      sleep 30
+
+      echo ">>> 检查后端"
+      for i in $(seq 1 20); do
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+          http://${DEPLOY_HOST}:${BACKEND_PORT}/health 2>/dev/null || echo "000")
+        if [ "$HTTP_CODE" = "200" ]; then
+          echo "✓ 后端健康检查通过"
+          curl -s http://${DEPLOY_HOST}:${BACKEND_PORT}/health
+          break
+        fi
+        echo "  等待后端... ($i/20) HTTP $HTTP_CODE"
+        sleep 5
+      done
+
+      echo ""
+      echo ">>> 检查前端"
+      for i in $(seq 1 10); do
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+          http://${DEPLOY_HOST}:${FRONTEND_PORT} 2>/dev/null || echo "000")
+        if [ "$HTTP_CODE" = "200" ]; then
+          echo "✓ 前端可用 ($HTTP_CODE)"
+          break
+        fi
+        echo "  等待前端... ($i/10)"
+        sleep 2
+      done
+
+      echo ""
+      echo "=========================================="
+      echo "  部署成功！"
+      echo "  后端: http://${DEPLOY_HOST}:${BACKEND_PORT}"
+      echo "  API:  http://${DEPLOY_HOST}:${BACKEND_PORT}/docs"
+      echo "  前端: http://${DEPLOY_HOST}:${FRONTEND_PORT}"
+      echo "=========================================="
+  when: on_success
+
+# ---------- 失败回滚 ----------
+rollback:
+  stage: verify
+  image: docker:24-cli
+  variables:
+    DOCKER_HOST: "tcp://${DEPLOY_HOST}:${DOCKER_PORT}"
+  script:
+    - echo ">>> 部署失败，回滚..."
+    - docker rm -f ${PROJECT_NAME}-backend ${PROJECT_NAME}-frontend ${PROJECT_NAME}-es 2>/dev/null || true
+    - echo "已清理所有容器"
+  when: on_failure
