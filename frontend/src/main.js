@@ -265,6 +265,8 @@ app.component('chat-panel', {
             }
         },
         async doQuery(retrieveFullDoc = false) {
+            // 防止 Vue 事件对象被当成参数传入
+            if (typeof retrieveFullDoc !== 'boolean') retrieveFullDoc = false;
             if (!this.question.trim() || !this.apiConfig.apiKey) return;
             const q = this.question.trim();
             this.messages.push({ id: Date.now(), role: 'user', content: q, timestamp: Date.now() });
