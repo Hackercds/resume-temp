@@ -29,6 +29,17 @@ class RAGService:
     # LLM 请求查看完整文档的标记
     _RETRIEVE_MARK = re.compile(r"\{\{retrieve_full_doc:([^}]+)\}\}")
 
+    # 意图识别关键词（规则版，零成本）
+    _FOLLOW_UP_KEYWORDS = {
+        '他', '她', '它', '这', '那', '这个', '那个', '这篇', '这份', '这个文件',
+        '上文', '前面', '刚才', '接着', '还有', '另外', '除此之外', '那么',
+        '为什么', '怎么', '多少', '多久', '哪些', '什么样'
+    }
+    _SUMMARIZE_KEYWORDS = {
+        '总结', '概括', '归纳', '对比', '比较', '区别', '不同', '相同', '优劣',
+        '整体', '全文', '主要', '主旨', '核心'
+    }
+
     def __init__(self,
                  embedding_service: EmbeddingService = None,
                  es_service: ESService = None,
@@ -39,6 +50,93 @@ class RAGService:
         self.llm = llm_service or LLMService()
         self.rerank = rerank_service  # 可选
         self.logger = get_logger()
+
+    def _classify_intent(self, question: str, history: List[Dict]) -> str:
+        """简单意图识别：new_topic / follow_up / summarize / clarify"""
+        if not history:
+            return "new_topic"
+        q = question.lower()
+        if any(k in q for k in self._SUMMARIZE_KEYWORDS):
+            return "summarize"
+        if any(k in q for k in self._FOLLOW_UP_KEYWORDS):
+            return "follow_up"
+        # 问题很短且有历史，大概率是追问
+        if len(question.strip()) < 10:
+            return "follow_up"
+        return "new_topic"
+
+    def _rewrite_query(self, question: str, intent: str, history: List[Dict]) -> str:
+        """根据意图重写检索查询"""
+        cfg = get_config().conversation
+        if not cfg.enable_query_rewrite or intent == "new_topic" or not history:
+            return question
+
+        # 取最近 2 条消息（通常是一问一答）作为上下文
+        recent = history[-2:] if len(history) >= 2 else history
+        context_text = "\n".join(
+            f"{'用户' if m.get('role') == 'user' else '助手'}: {m.get('content', '')[:240]}"
+            for m in recent
+        )
+
+        if intent == "follow_up":
+            return f"结合前文讨论：\n{context_text}\n\n当前追问：{question}"
+        if intent == "summarize":
+            return f"请基于以下内容总结或对比：\n{context_text}\n\n用户要求：{question}"
+        if intent == "clarify":
+            return f"{question}（上下文：{context_text[:300]}）"
+        return question
+
+    def _extract_historical_files(self, history: List[Dict]) -> Set[str]:
+        """从历史 assistant 消息中提取用过的 file_name"""
+        historical_files = set()
+        if not history:
+            return historical_files
+        for m in history:
+            if m.get("role") == "assistant" and m.get("sources"):
+                for s in m["sources"]:
+                    if s.get("file_name"):
+                        historical_files.add(s["file_name"])
+        return historical_files
+
+    def _boost_historical_sources(self, candidates: List[Dict],
+                                  history: List[Dict],
+                                  boost: float = 0.15) -> List[Dict]:
+        """对历史来源文档的 chunks 进行加权"""
+        if not history or boost <= 0:
+            return candidates
+        historical_files = self._extract_historical_files(history)
+        if not historical_files:
+            return candidates
+
+        for c in candidates:
+            if c.get("file_name") in historical_files:
+                c["score"] = c.get("score", 0) + boost
+        # 重新按分数排序
+        candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
+        return candidates
+
+    def _compress_history(self, history: List[Dict], threshold: int = 3) -> List[Dict]:
+        """
+        压缩历史：保留最近 2 轮完整内容，更早的历史生成摘要。
+        当前使用规则摘要（取 user 消息拼接），后续可升级为 LLM 摘要。
+        """
+        if not history or len(history) <= threshold * 2:
+            return history
+
+        # 最近 2 轮完整保留
+        recent = history[-4:]
+        older = history[:-4]
+
+        # 规则摘要：提取更早历史中的 user 问题
+        older_questions = [m.get("content", "")[:80]
+                           for m in older if m.get("role") == "user"]
+        summary = "；".join(older_questions)
+        if len(summary) > 400:
+            summary = summary[:400] + "..."
+
+        compressed = [{"role": "system", "content": f"更早的对话摘要：{summary}"}]
+        compressed.extend(recent)
+        return compressed
 
     def query(self, question: str, api_key: str,
               provider: str = "openai", model: str = None,
@@ -57,11 +155,24 @@ class RAGService:
         """
         trace_id = str(uuid.uuid4())[:8]
         timing = {}
+        cfg = get_config().conversation
 
-        # Step 1: 查询向量化
+        # 意图识别 + 查询重写
+        intent = self._classify_intent(question, history)
+        rewritten_question = self._rewrite_query(question, intent, history)
+        # 压缩历史，避免淹没上下文
+        compressed_history = self._compress_history(history, threshold=cfg.summary_threshold)
+
+        self.logger.info(trace_id, "rag_service",
+                         "意图识别完成",
+                         intent=intent,
+                         original=question[:80],
+                         rewritten=rewritten_question[:120])
+
+        # Step 1: 查询向量化（使用重写后的问题）
         embed_start = time.time()
         try:
-            query_vector = self.embedding.encode_query(question)
+            query_vector = self.embedding.encode_query(rewritten_question)
         except ModelLoadError:
             # 降级到纯 BM25
             self.logger.warn(trace_id, "rag_service",
@@ -75,11 +186,11 @@ class RAGService:
                          "Step1 Embedding 完成",
                          duration_ms=round(embed_time, 1))
 
-        # Step 2: ES 混合检索
+        # Step 2: ES 混合检索（使用重写后的问题）
         search_start = time.time()
         try:
             candidates = self.es.search_hybrid(
-                query_vector, query_text=question,
+                query_vector, query_text=rewritten_question,
                 top_k=top_k * 2,  # 检索 2 倍给重排留空间
                 min_score=get_config().retrieval.min_score
             )
@@ -107,12 +218,12 @@ class RAGService:
 
         # Step 4: 空检索 / 低质量结果 → 尝试多实体分解检索
         if not candidates or len(candidates) < 3:
-            entities = self._extract_entities(question)
+            entities = self._extract_entities(rewritten_question)
             if len(entities) >= 2:
                 self.logger.info(trace_id, "rag_service",
                                  "向量检索结果不足，启用多实体分解检索",
                                  entities=entities, original_count=len(candidates))
-                decomposed = self._multi_entity_retrieve(question, entities, top_k)
+                decomposed = self._multi_entity_retrieve(rewritten_question, entities, top_k)
                 if decomposed:
                     seen = {c["chunk_id"] for c in candidates}
                     for c in decomposed:
@@ -143,10 +254,21 @@ class RAGService:
             if full_docs:
                 candidates = full_docs
 
-        # Step 7: 拼接上下文
+        # Step 7: 来源复用加权（放在重排后，避免干扰重排）
+        candidates = self._boost_historical_sources(
+            candidates, history, boost=cfg.source_boost
+        )
+
+        # summarize 意图扩大最终返回数量
+        if intent == "summarize":
+            top_k = max(top_k, 10)
+
+        candidates = candidates[:top_k]
+
+        # Step 8: 拼接上下文
         context = self._build_context(candidates)
 
-        # Step 8: 调用 LLM 生成
+        # Step 9: 调用 LLM 生成
         llm_start = time.time()
         try:
             answer = self.llm.generate(
@@ -156,7 +278,7 @@ class RAGService:
                 provider=provider,
                 model=model,
                 base_url=base_url,
-                history=history,
+                history=compressed_history,
                 allow_full_doc_retrieval=(not retrieve_full_doc)
             )
         except LLMAPIError as e:
@@ -166,10 +288,10 @@ class RAGService:
         llm_time = time.time() - llm_start
         timing["llm_s"] = round(llm_time, 1)
         self.logger.info(trace_id, "rag_service",
-                         "Step8 LLM 生成完成",
+                         "Step9 LLM 生成完成",
                          duration_s=round(llm_time, 1))
 
-        # Step 9: 检测 LLM 是否请求查看完整文档
+        # Step 10: 检测 LLM 是否请求查看完整文档
         requested_file = self._need_full_document(answer)
         if requested_file and not retrieve_full_doc and get_config().retrieval.enable_full_document:
             self.logger.info(trace_id, "rag_service",
@@ -185,7 +307,7 @@ class RAGService:
                         provider=provider,
                         model=model,
                         base_url=base_url,
-                        history=history,
+                        history=compressed_history,
                         allow_full_doc_retrieval=False  # 避免无限循环
                     )
                     candidates = full_docs
@@ -226,11 +348,23 @@ class RAGService:
         """
         trace_id = str(uuid.uuid4())[:8]
         timing = {}
+        cfg = get_config().conversation
 
-        # Step 1: 查询向量化
+        # 意图识别 + 查询重写 + 历史压缩
+        intent = self._classify_intent(question, history)
+        rewritten_question = self._rewrite_query(question, intent, history)
+        compressed_history = self._compress_history(history, threshold=cfg.summary_threshold)
+
+        self.logger.info(trace_id, "rag_service",
+                         "流式查询意图识别完成",
+                         intent=intent,
+                         original=question[:80],
+                         rewritten=rewritten_question[:120])
+
+        # Step 1: 查询向量化（使用重写后的问题）
         embed_start = time.time()
         try:
-            query_vector = self.embedding.encode_query(question)
+            query_vector = self.embedding.encode_query(rewritten_question)
         except ModelLoadError:
             self.logger.warn(trace_id, "rag_service",
                              "Embedding加载失败，流式查询终止")
@@ -239,11 +373,11 @@ class RAGService:
         embed_time = (time.time() - embed_start) * 1000
         timing["embedding_ms"] = round(embed_time, 1)
 
-        # Step 2: ES 混合检索
+        # Step 2: ES 混合检索（使用重写后的问题）
         search_start = time.time()
         try:
             candidates = self.es.search_hybrid(
-                query_vector, query_text=question,
+                query_vector, query_text=rewritten_question,
                 top_k=top_k * 2,
                 min_score=get_config().retrieval.min_score
             )
@@ -256,15 +390,15 @@ class RAGService:
 
         # Step 3: 可选重排
         if self.rerank and len(candidates) > top_k:
-            candidates = self.rerank.rerank(question, candidates, top_k=top_k)
+            candidates = self.rerank.rerank(rewritten_question, candidates, top_k=top_k)
         else:
             candidates = candidates[:top_k]
 
         # Step 4: 多实体分解检索
         if not candidates or len(candidates) < 3:
-            entities = self._extract_entities(question)
+            entities = self._extract_entities(rewritten_question)
             if len(entities) >= 2:
-                decomposed = self._multi_entity_retrieve(question, entities, top_k)
+                decomposed = self._multi_entity_retrieve(rewritten_question, entities, top_k)
                 if decomposed:
                     seen = {c["chunk_id"] for c in candidates}
                     for c in decomposed:
@@ -287,10 +421,21 @@ class RAGService:
             if full_docs:
                 candidates = full_docs
 
-        # Step 7: 拼接上下文
+        # Step 7: 来源复用加权
+        candidates = self._boost_historical_sources(
+            candidates, history, boost=cfg.source_boost
+        )
+
+        # summarize 意图扩大最终返回数量
+        if intent == "summarize":
+            top_k = max(top_k, 10)
+
+        candidates = candidates[:top_k]
+
+        # Step 8: 拼接上下文
         context = self._build_context(candidates)
 
-        # Step 8: 流式生成
+        # Step 9: 流式生成
         llm_start = time.time()
         answer_parts = []
         try:
@@ -301,7 +446,7 @@ class RAGService:
                 provider=provider,
                 model=model,
                 base_url=base_url,
-                history=history,
+                history=compressed_history,
                 allow_full_doc_retrieval=(not retrieve_full_doc)
             ):
                 answer_parts.append(token)
@@ -315,7 +460,7 @@ class RAGService:
 
         answer = "".join(answer_parts)
 
-        # Step 9: 检测 LLM 是否请求查看完整文档
+        # Step 10: 检测 LLM 是否请求查看完整文档
         requested_file = self._need_full_document(answer)
         if requested_file and not retrieve_full_doc and get_config().retrieval.enable_full_document:
             yield {"type": "token", "content": "\n\n[正在召回完整文档...]\n"}
@@ -331,7 +476,7 @@ class RAGService:
                         provider=provider,
                         model=model,
                         base_url=base_url,
-                        history=history,
+                        history=compressed_history,
                         allow_full_doc_retrieval=False
                     ):
                         answer_parts.append(token)

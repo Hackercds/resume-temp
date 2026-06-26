@@ -53,9 +53,12 @@ retrieval:
   enable_full_document: true
 
 conversation:
-  max_history: 10
+  max_history: 5
   context_window: 8000
   enable_full_document: true
+  enable_query_rewrite: true
+  source_boost: 0.15
+  summary_threshold: 3
 
 cors:
   allowed_origins:

@@ -64,9 +64,12 @@ class RetrievalConfig(BaseModel):
 
 
 class ConversationConfig(BaseModel):
-    max_history: int = 10
+    max_history: int = 5
     context_window: int = 8000
     enable_full_document: bool = True
+    enable_query_rewrite: bool = True
+    source_boost: float = 0.15
+    summary_threshold: int = 3
 
 
 class CorsConfig(BaseModel):

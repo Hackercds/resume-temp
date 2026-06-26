@@ -234,7 +234,8 @@ app.component('chat-panel', {
             error: '',
             expandedIdx: -1,
             expandedMsgIdx: -1,
-            maxHistory: 3
+            maxHistory: 5
+
         };
     },
     mounted() {
@@ -277,7 +278,14 @@ app.component('chat-panel', {
             const history = this.messages
                 .filter(m => m.role === 'user' || m.role === 'assistant')
                 .slice(-(this.maxHistory * 2))
-                .map(m => ({ role: m.role, content: m.content }));
+                .map(m => ({
+                    role: m.role,
+                    content: m.content,
+                    sources: (m.sources || []).map(s => ({
+                        file_name: s.file_name,
+                        score: s.score
+                    }))
+                }));
 
             const assistantMsg = {
                 id: Date.now() + 1,
