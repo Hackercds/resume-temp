@@ -234,7 +234,7 @@ app.component('chat-panel', {
             error: '',
             expandedIdx: -1,
             expandedMsgIdx: -1,
-            maxHistory: 10
+            maxHistory: 3
         };
     },
     mounted() {
@@ -333,12 +333,27 @@ app.component('chat-panel', {
             if (!lastMsg || !lastMsg.sources || !lastMsg.sources.length) return;
             const idx = this.messages.indexOf(lastMsg);
             if (idx < 0) return;
-            const q = this.messages.slice(0, idx).reverse().find(m => m.role === 'user');
-            if (!q) return;
+
+            // 收集当前答案所对应的问题及前文相关 user 问题，构造更完整的查询
+            const priorUserMsgs = this.messages.slice(0, idx).filter(m => m.role === 'user');
+            let queryText = '';
+            if (priorUserMsgs.length >= 2) {
+                // 取最近两个用户问题，把短指代替换成前一个问题的主体
+                const lastTwo = priorUserMsgs.slice(-2);
+                queryText = `${lastTwo[0].content}；${lastTwo[1].content}`;
+            } else if (priorUserMsgs.length === 1) {
+                queryText = priorUserMsgs[0].content;
+            }
+            if (!queryText) return;
+
+            // 取当前答案涉及的所有来源文件，全部召回完整文档
+            const targetFiles = [...new Set(lastMsg.sources.map(s => s.file_name))];
+            if (!targetFiles.length) return;
+
             this.loading = true; this.error = '';
             try {
                 const body = {
-                    question: q.content,
+                    question: queryText,
                     api_key: this.apiConfig.apiKey,
                     provider: this.apiConfig.provider,
                     model: this.apiConfig.model || null,
@@ -372,7 +387,7 @@ app.component('chat-panel', {
                         this.$emit('notify', err.message, 'error');
                     }
                 );
-                this.$emit('notify', '已基于完整文档重新生成答案');
+                this.$emit('notify', `已基于完整文档重新生成答案：${targetFiles.join(', ')}`);
             } catch (e) {
                 this.error = e.message;
                 this.$emit('notify', e.message, 'error');

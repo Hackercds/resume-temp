@@ -175,9 +175,11 @@ class LLMService:
     async def generate_stream(self, question: str, context: str,
                               api_key: str, provider: str = "openai",
                               model: str = None, base_url: str = None,
-                              history: List[Dict] = None):
+                              history: List[Dict] = None,
+                              allow_full_doc_retrieval: bool = True):
         """
         流式生成接口 - yield 每个内容 token（不含思考过程）
+        allow_full_doc_retrieval: 是否允许 LLM 请求召回完整文档
         """
         cfg = get_config()
         llm_cfg = cfg.llm
@@ -186,12 +188,14 @@ class LLMService:
 
         if provider in ("openai", "custom"):
             async for token in self._call_openai_stream(
-                api_key, model, question, context, base_url, history
+                api_key, model, question, context, base_url, history,
+                allow_full_doc_retrieval
             ):
                 yield token
         elif provider == "anthropic":
             async for token in self._call_anthropic_stream(
-                api_key, model, question, context, base_url, history
+                api_key, model, question, context, base_url, history,
+                allow_full_doc_retrieval
             ):
                 yield token
         else:
@@ -200,7 +204,8 @@ class LLMService:
     async def _call_openai_stream(self, api_key: str, model: str,
                                   question: str, context: str,
                                   base_url: str = None,
-                                  history: List[Dict] = None):
+                                  history: List[Dict] = None,
+                                  allow_full_doc_retrieval: bool = True):
         """
         OpenAI 兼容流式调用 - 只返回 content，过滤 reasoning_content
         """
@@ -224,7 +229,7 @@ class LLMService:
                     messages.append({"role": m["role"], "content": m["content"]})
 
         user_prompt = self._build_prompt(question, context,
-                                         allow_full_doc_retrieval=False)
+                                         allow_full_doc_retrieval=allow_full_doc_retrieval)
         messages.append({"role": "user", "content": user_prompt})
 
         body = {
@@ -281,7 +286,8 @@ class LLMService:
     async def _call_anthropic_stream(self, api_key: str, model: str,
                                      question: str, context: str,
                                      base_url: str = None,
-                                     history: List[Dict] = None):
+                                     history: List[Dict] = None,
+                                     allow_full_doc_retrieval: bool = True):
         """
         Anthropic 流式调用 - 忽略 thinking，只返回 text_delta
         """
@@ -303,7 +309,7 @@ class LLMService:
                     messages.append({"role": m["role"], "content": m["content"]})
 
         user_prompt = self._build_prompt(question, context,
-                                         allow_full_doc_retrieval=False)
+                                         allow_full_doc_retrieval=allow_full_doc_retrieval)
         messages.append({"role": "user", "content": user_prompt})
 
         body = {
@@ -360,19 +366,21 @@ class LLMService:
         full_doc_hint = ""
         if allow_full_doc_retrieval:
             full_doc_hint = """
-5. 如果当前检索到的片段信息不完整、不足以准确回答，你可以请求查看完整文档。
+5. 如果当前检索到的片段信息不完整、碎片化、或缺少全局背景，导致你无法准确回答，请主动请求查看完整文档。
    请求格式必须严格为：{{retrieve_full_doc:文件名}}
    例如：{{retrieve_full_doc:张三简历.pdf}}
-   只需要输出这一行标记，系统会自动召回该文件完整内容并重新生成答案。"""
+   你只需要输出这一行标记（不要加任何解释），系统会自动召回该文件完整内容并重新生成答案。"""
 
-        return f"""已知信息（来自知识库检索，可能有不准确之处，请结合上下文判断）：
+        return f"""你是知识库问答助手。请严格基于下面的"已知信息"回答用户问题，不要编造信息。
+
+已知信息（来自知识库检索，可能有不准确之处，请结合上下文判断。本次检索结果是回答的主要依据）：
 
 {context}
 
-问题：{question}
+用户问题：{question}
 
 回答要求：
-1. 如果知识库中有明确相关信息，请基于已知信息回答，并引用对应的来源编号
-2. 如果知识库中完全没有相关信息，请如实说明"知识库中未找到相关内容"
-3. 回答要简洁准确，不要编造知识库中没有的信息
-4. 回答使用中文{full_doc_hint}"""
+1. 优先基于上面的"已知信息"回答，并引用对应的来源编号。
+2. 如果"已知信息"完全不相关，请如实说明"知识库中未找到相关内容"。
+3. 回答要简洁准确，不要编造知识库中没有的信息。
+4. 回答使用中文。{full_doc_hint}"""

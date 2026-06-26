@@ -301,7 +301,8 @@ class RAGService:
                 provider=provider,
                 model=model,
                 base_url=base_url,
-                history=history
+                history=history,
+                allow_full_doc_retrieval=(not retrieve_full_doc)
             ):
                 answer_parts.append(token)
                 yield {"type": "token", "content": token}
@@ -330,7 +331,8 @@ class RAGService:
                         provider=provider,
                         model=model,
                         base_url=base_url,
-                        history=history
+                        history=history,
+                        allow_full_doc_retrieval=False
                     ):
                         answer_parts.append(token)
                         yield {"type": "token", "content": token}
