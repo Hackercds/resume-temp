@@ -10,11 +10,13 @@ API 接口层 - 面试点：Handler 层只做参数校验和路由，不写业�
 - GET  /api/stats          → 知识库统计
 - GET  /health             → 健康检查
 """
+import json
 import time
 import uuid
 from urllib.parse import unquote
 
 from fastapi import APIRouter, Request, UploadFile, File, Form, HTTPException
+from fastapi.responses import StreamingResponse
 from typing import Optional
 
 from internal.model.dto import (
@@ -180,6 +182,51 @@ async def rag_query(request: Request, body: QueryRequest):
         logger.error(rid, "api_handler", "查询异常",
                      error=str(e))
         return APIResponse.error(50004, f"查询失败: {str(e)}", rid).model_dump()
+
+
+# ---------- POST /api/query/stream ----------
+@router.post("/api/query/stream")
+async def rag_query_stream(request: Request, body: QueryRequest):
+    """
+    RAG 问答流式接口 - SSE
+    保留 /api/query 同步接口，新增流式端点用于前端逐字显示
+    """
+    rid = _generate_request_id(request)
+    logger.info(rid, "api_handler", "收到流式查询请求",
+                question=body.question[:100],
+                provider=body.provider, top_k=body.top_k)
+
+    if not body.question.strip():
+        return APIResponse.error(40001, "问题不能为空", rid).model_dump()
+
+    async def event_generator():
+        try:
+            rag_service = _get_rag_service()
+            async for event in rag_service.query_stream(
+                question=body.question,
+                api_key=body.api_key,
+                provider=body.provider,
+                model=body.model,
+                base_url=body.base_url,
+                top_k=body.top_k,
+                history=[m.model_dump() for m in body.history] if body.history else None,
+                retrieve_full_doc=body.retrieve_full_doc
+            ):
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            logger.error(rid, "api_handler", "流式查询异常", error=str(e))
+            err = {"type": "error", "message": f"查询失败: {str(e)}"}
+            yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Content-Type": "text/event-stream; charset=utf-8"
+        }
+    )
 
 
 # ---------- POST /api/knowledge/upload ----------

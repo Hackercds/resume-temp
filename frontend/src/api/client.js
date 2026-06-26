@@ -32,6 +32,62 @@ class ApiClient {
     }
 
     /**
+     * POST /api/query/stream - 流式 RAG 问答
+     */
+    static async queryStream(body, onToken, onDone, onError) {
+        const payload = {
+            question: body.question,
+            api_key: body.api_key,
+            provider: body.provider,
+            model: body.model,
+            base_url: body.base_url,
+            top_k: body.top_k || 5,
+            history: body.history || [],
+            session_id: body.session_id || null,
+            retrieve_full_doc: body.retrieve_full_doc || false
+        };
+
+        const res = await fetch(`${API_BASE}/api/query/stream`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+
+        if (!res.ok || !res.body) {
+            const data = await res.json().catch(() => ({}));
+            throw new Error(data.message || `请求失败 (${res.status})`);
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let buffer = '';
+
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop();
+            for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed || !trimmed.startsWith('data: ')) continue;
+                const dataStr = trimmed.slice(6);
+                if (dataStr === '[DONE]') continue;
+                try {
+                    const event = JSON.parse(dataStr);
+                    if (event.type === 'token') {
+                        if (onToken) onToken(event.content);
+                    } else if (event.type === 'done') {
+                        if (onDone) onDone(event);
+                    } else if (event.type === 'error') {
+                        if (onError) onError(new Error(event.message));
+                    }
+                } catch (e) { /* 忽略解析失败的行 */ }
+            }
+        }
+    }
+
+    /**
      * POST /api/knowledge/upload - 上传文档
      */
     static async uploadDocument(formData) {

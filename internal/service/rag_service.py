@@ -215,6 +215,147 @@ class RAGService:
             "timing": timing
         }
 
+    async def query_stream(self, question: str, api_key: str,
+                           provider: str = "openai", model: str = None,
+                           base_url: str = None, top_k: int = 5,
+                           history: List[Dict] = None,
+                           retrieve_full_doc: bool = False):
+        """
+        流式 RAG 查询 - 前 7 步同步执行，第 8 步流式生成 LLM token。
+        yield SSE 事件字典：{"type": "token"/"done"/"error", ...}
+        """
+        trace_id = str(uuid.uuid4())[:8]
+        timing = {}
+
+        # Step 1: 查询向量化
+        embed_start = time.time()
+        try:
+            query_vector = self.embedding.encode_query(question)
+        except ModelLoadError:
+            self.logger.warn(trace_id, "rag_service",
+                             "Embedding加载失败，流式查询终止")
+            yield {"type": "error", "message": "Embedding 加载失败，无法流式生成"}
+            return
+        embed_time = (time.time() - embed_start) * 1000
+        timing["embedding_ms"] = round(embed_time, 1)
+
+        # Step 2: ES 混合检索
+        search_start = time.time()
+        try:
+            candidates = self.es.search_hybrid(
+                query_vector, query_text=question,
+                top_k=top_k * 2,
+                min_score=get_config().retrieval.min_score
+            )
+        except ESConnectionError as e:
+            self.logger.error(trace_id, "rag_service", "ES 连接失败", error=str(e))
+            yield {"type": "error", "message": "检索服务暂时不可用，请稍后重试"}
+            return
+        search_time = (time.time() - search_start) * 1000
+        timing["search_ms"] = round(search_time, 1)
+
+        # Step 3: 可选重排
+        if self.rerank and len(candidates) > top_k:
+            candidates = self.rerank.rerank(question, candidates, top_k=top_k)
+        else:
+            candidates = candidates[:top_k]
+
+        # Step 4: 多实体分解检索
+        if not candidates or len(candidates) < 3:
+            entities = self._extract_entities(question)
+            if len(entities) >= 2:
+                decomposed = self._multi_entity_retrieve(question, entities, top_k)
+                if decomposed:
+                    seen = {c["chunk_id"] for c in candidates}
+                    for c in decomposed:
+                        if c["chunk_id"] not in seen:
+                            candidates.append(c)
+                            seen.add(c["chunk_id"])
+                    timing["decomposed"] = True
+                    timing["decomposed_count"] = len(decomposed)
+
+        # Step 5: 空检索兜底
+        if not candidates:
+            yield {"type": "error", "message": "知识库中未找到与您问题相关的信息"}
+            return
+
+        # Step 6: 用户手动触发整篇文档召回
+        if retrieve_full_doc and get_config().retrieval.enable_full_document:
+            full_docs = self._retrieve_full_documents(
+                list({c["file_name"] for c in candidates})
+            )
+            if full_docs:
+                candidates = full_docs
+
+        # Step 7: 拼接上下文
+        context = self._build_context(candidates)
+
+        # Step 8: 流式生成
+        llm_start = time.time()
+        answer_parts = []
+        try:
+            async for token in self.llm.generate_stream(
+                question=question,
+                context=context,
+                api_key=api_key,
+                provider=provider,
+                model=model,
+                base_url=base_url,
+                history=history
+            ):
+                answer_parts.append(token)
+                yield {"type": "token", "content": token}
+        except LLMAPIError as e:
+            self.logger.error(trace_id, "rag_service", "LLM流式调用失败", error=str(e))
+            yield {"type": "error", "message": f"LLM 调用失败: {str(e)}"}
+            return
+        llm_time = time.time() - llm_start
+        timing["llm_s"] = round(llm_time, 1)
+
+        answer = "".join(answer_parts)
+
+        # Step 9: 检测 LLM 是否请求查看完整文档
+        requested_file = self._need_full_document(answer)
+        if requested_file and not retrieve_full_doc and get_config().retrieval.enable_full_document:
+            yield {"type": "token", "content": "\n\n[正在召回完整文档...]\n"}
+            full_docs = self._retrieve_full_documents([requested_file])
+            if full_docs:
+                full_context = self._build_context(full_docs)
+                answer_parts.clear()
+                try:
+                    async for token in self.llm.generate_stream(
+                        question=question,
+                        context=full_context,
+                        api_key=api_key,
+                        provider=provider,
+                        model=model,
+                        base_url=base_url,
+                        history=history
+                    ):
+                        answer_parts.append(token)
+                        yield {"type": "token", "content": token}
+                    answer = "".join(answer_parts)
+                    candidates = full_docs
+                    timing["full_doc_retrieval"] = True
+                except LLMAPIError as e:
+                    self.logger.error(trace_id, "rag_service",
+                                      "整篇文档流式重新生成失败", error=str(e))
+
+        yield {
+            "type": "done",
+            "answer": answer,
+            "sources": [
+                {
+                    "content": c.get("content", ""),
+                    "file_name": c.get("file_name", ""),
+                    "score": round(c.get("rerank_score", c.get("score", 0)), 3)
+                }
+                for c in candidates
+            ],
+            "trace_id": trace_id,
+            "timing": timing
+        }
+
     def _query_bm25_fallback(self, question: str, api_key: str,
                              provider: str, model: str,
                              top_k: int, trace_id: str,

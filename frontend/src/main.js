@@ -279,6 +279,17 @@ app.component('chat-panel', {
                 .slice(-(this.maxHistory * 2))
                 .map(m => ({ role: m.role, content: m.content }));
 
+            const assistantMsg = {
+                id: Date.now() + 1,
+                role: 'assistant',
+                content: '',
+                sources: [],
+                timing: null,
+                trace_id: '',
+                timestamp: Date.now()
+            };
+            this.messages.push(assistantMsg);
+
             try {
                 const body = {
                     question: q,
@@ -291,16 +302,25 @@ app.component('chat-panel', {
                     retrieve_full_doc: retrieveFullDoc
                 };
                 if (this.apiConfig.baseUrl) body.base_url = this.apiConfig.baseUrl;
-                const r = await ApiClient.query(body);
-                this.messages.push({
-                    id: Date.now() + 1,
-                    role: 'assistant',
-                    content: r.answer,
-                    sources: r.sources || [],
-                    timing: r.timing || null,
-                    timestamp: Date.now()
-                });
-                this.saveSession();
+
+                await ApiClient.queryStream(
+                    body,
+                    (token) => {
+                        assistantMsg.content += token;
+                        this.scrollToBottom();
+                    },
+                    (data) => {
+                        assistantMsg.content = data.answer || assistantMsg.content;
+                        assistantMsg.sources = data.sources || [];
+                        assistantMsg.timing = data.timing || null;
+                        assistantMsg.trace_id = data.trace_id || '';
+                        this.saveSession();
+                    },
+                    (err) => {
+                        this.error = err.message;
+                        this.$emit('notify', err.message, 'error');
+                    }
+                );
             } catch (e) {
                 this.error = e.message;
                 this.$emit('notify', e.message, 'error');
@@ -328,17 +348,37 @@ app.component('chat-panel', {
                     retrieve_full_doc: true
                 };
                 if (this.apiConfig.baseUrl) body.base_url = this.apiConfig.baseUrl;
-                const r = await ApiClient.query(body);
-                lastMsg.content = r.answer;
-                lastMsg.sources = r.sources || [];
-                lastMsg.timing = r.timing || null;
-                this.saveSession();
+
+                const assistantMsg = lastMsg;
+                assistantMsg.content = '';
+                assistantMsg.sources = [];
+                assistantMsg.timing = null;
+
+                await ApiClient.queryStream(
+                    body,
+                    (token) => {
+                        assistantMsg.content += token;
+                        this.scrollToBottom();
+                    },
+                    (data) => {
+                        assistantMsg.content = data.answer || assistantMsg.content;
+                        assistantMsg.sources = data.sources || [];
+                        assistantMsg.timing = data.timing || null;
+                        assistantMsg.trace_id = data.trace_id || '';
+                        this.saveSession();
+                    },
+                    (err) => {
+                        this.error = err.message;
+                        this.$emit('notify', err.message, 'error');
+                    }
+                );
                 this.$emit('notify', '已基于完整文档重新生成答案');
             } catch (e) {
                 this.error = e.message;
                 this.$emit('notify', e.message, 'error');
             } finally {
                 this.loading = false;
+                this.scrollToBottom();
             }
         },
         newSession() {

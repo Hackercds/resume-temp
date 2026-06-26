@@ -172,6 +172,179 @@ class LLMService:
         except Exception as e:
             raise LLMAPIError(f"API 调用异常: {str(e)}")
 
+    async def generate_stream(self, question: str, context: str,
+                              api_key: str, provider: str = "openai",
+                              model: str = None, base_url: str = None,
+                              history: List[Dict] = None):
+        """
+        流式生成接口 - yield 每个内容 token（不含思考过程）
+        """
+        cfg = get_config()
+        llm_cfg = cfg.llm
+        provider = provider or llm_cfg.default_provider
+        model = model or llm_cfg.default_model
+
+        if provider in ("openai", "custom"):
+            async for token in self._call_openai_stream(
+                api_key, model, question, context, base_url, history
+            ):
+                yield token
+        elif provider == "anthropic":
+            async for token in self._call_anthropic_stream(
+                api_key, model, question, context, base_url, history
+            ):
+                yield token
+        else:
+            raise LLMAPIError(f"不支持的 Provider: {provider}，可选 openai / anthropic / custom")
+
+    async def _call_openai_stream(self, api_key: str, model: str,
+                                  question: str, context: str,
+                                  base_url: str = None,
+                                  history: List[Dict] = None):
+        """
+        OpenAI 兼容流式调用 - 只返回 content，过滤 reasoning_content
+        """
+        if base_url:
+            url = base_url.rstrip("/") + "/chat/completions"
+        else:
+            url = "https://api.openai.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+
+        messages = [
+            {"role": "system",
+             "content": "你是一个专业的知识库问答助手。请严格基于知识库内容回答，不要编造信息。"}
+        ]
+        if history:
+            for m in history:
+                if m.get("role") in ("user", "assistant") and m.get("content"):
+                    messages.append({"role": m["role"], "content": m["content"]})
+
+        user_prompt = self._build_prompt(question, context,
+                                         allow_full_doc_retrieval=False)
+        messages.append({"role": "user", "content": user_prompt})
+
+        body = {
+            "model": model,
+            "messages": messages,
+            "temperature": self.default_temperature,
+            "max_tokens": self.default_max_tokens,
+            "stream": True,
+            "stream_options": {"include_usage": False}
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                async with client.stream("POST", url, headers=headers, json=body) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        line = line.strip()
+                        if not line or line == "data: [DONE]":
+                            continue
+                        if not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]
+                        try:
+                            data = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+                        choices = data.get("choices", [])
+                        if not choices:
+                            continue
+                        delta = choices[0].get("delta", {})
+                        # 只输出 content，忽略 reasoning_content / thinking
+                        content = delta.get("content")
+                        if content:
+                            yield content
+        except httpx.HTTPStatusError as e:
+            error_detail = ""
+            try:
+                error_detail = await e.response.aread()
+                error_detail = error_detail.decode('utf-8', errors='ignore')
+            except Exception:
+                error_detail = str(e)
+            self.logger.error("llm_stream", "llm_service",
+                              "OpenAI 流式调用失败",
+                              status=e.response.status_code if e.response else 0,
+                              error=str(error_detail)[:200])
+            if e.response is not None and e.response.status_code == 401:
+                raise LLMAPIError("API Key 无效，请检查后重试")
+            raise LLMAPIError(f"OpenAI API 流式调用失败: {str(error_detail)[:100]}")
+        except httpx.TimeoutException:
+            raise LLMAPIError(f"API 流式调用超时 ({self.timeout}s)，请稍后重试")
+        except Exception as e:
+            raise LLMAPIError(f"API 流式调用异常: {str(e)}")
+
+    async def _call_anthropic_stream(self, api_key: str, model: str,
+                                     question: str, context: str,
+                                     base_url: str = None,
+                                     history: List[Dict] = None):
+        """
+        Anthropic 流式调用 - 忽略 thinking，只返回 text_delta
+        """
+        if base_url:
+            url = base_url.rstrip("/") + "/messages"
+        else:
+            url = "https://api.anthropic.com/v1/messages"
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+
+        messages = []
+        if history:
+            for m in history:
+                if m.get("role") in ("user", "assistant") and m.get("content"):
+                    messages.append({"role": m["role"], "content": m["content"]})
+
+        user_prompt = self._build_prompt(question, context,
+                                         allow_full_doc_retrieval=False)
+        messages.append({"role": "user", "content": user_prompt})
+
+        body = {
+            "model": model,
+            "max_tokens": self.default_max_tokens,
+            "temperature": self.default_temperature,
+            "system": "你是一个专业的知识库问答助手。请严格基于知识库内容回答，不要编造信息。",
+            "messages": messages,
+            "stream": True
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                async with client.stream("POST", url, headers=headers, json=body) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        line = line.strip()
+                        if not line or not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]
+                        try:
+                            data = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+                        event_type = data.get("type")
+                        if event_type == "content_block_delta":
+                            delta = data.get("delta", {})
+                            if delta.get("type") == "text_delta":
+                                text = delta.get("text", "")
+                                if text:
+                                    yield text
+                        # 忽略 thinking、content_block_start、content_block_stop 等
+        except httpx.HTTPStatusError as e:
+            if e.response is not None and e.response.status_code == 401:
+                raise LLMAPIError("API Key 无效，请检查后重试")
+            raise LLMAPIError(f"Anthropic API 流式调用失败: HTTP {e.response.status_code if e.response else 0}")
+        except httpx.TimeoutException:
+            raise LLMAPIError(f"API 流式调用超时 ({self.timeout}s)，请稍后重试")
+        except Exception as e:
+            raise LLMAPIError(f"API 流式调用异常: {str(e)}")
+
     def _build_prompt(self, question: str, context: str,
                       allow_full_doc_retrieval: bool = True) -> str:
         """
