@@ -152,38 +152,59 @@ app.component('chat-panel', {
             ⚠️ 请先在上方填入 API Key 才能开始提问
         </div>
 
-        <div class="card">
-            <!-- 加载中 -->
-            <div v-if="loading" class="loading">
-                <div class="spinner"></div>
-                <p>正在检索知识库...</p>
-            </div>
-
-            <!-- 答案 -->
-            <div v-else-if="answer">
-                <div v-if="timing" class="timing-badge">
-                    <span>🔍 向量化 {{ timing.embedding_ms }}ms</span>
-                    <span>📡 检索 {{ timing.search_ms }}ms</span>
-                    <span>🤖 生成 {{ timing.llm_s }}s</span>
+        <!-- 会话工具栏 -->
+        <div class="card chat-toolbar">
+            <button class="btn-new-chat" @click="newSession">➕ 新建对话</button>
+            <div class="session-bar">
+                <div v-for="s in sessions" :key="s.id"
+                     :class="['session-chip', { active: s.id === currentSessionId }]"
+                     @click="loadSession(s.id)">
+                    {{ s.title }}
                 </div>
-                <div class="answer-box" v-html="renderMarkdown(answer)"></div>
+            </div>
+        </div>
 
-                <div v-if="sources.length" class="source-list">
-                    <h4>📄 引用来源 ({{ sources.length }})</h4>
-                    <div v-for="(s, i) in sources" :key="i"
-                        class="source-item" :class="{ open: expandedIdx === i }"
-                        @click="expandedIdx = expandedIdx === i ? -1 : i">
-                        <div class="source-header">
-                            <span>{{ s.file_name }}</span>
-                            <span class="badge">相关度 {{ s.score }}</span>
+        <div class="card chat-card">
+            <!-- 消息列表 -->
+            <div v-if="messages.length" class="message-list" ref="messageList">
+                <div v-for="(msg, mIdx) in messages" :key="msg.id"
+                     :class="['message', msg.role]">
+                    <div class="message-bubble">
+                        <div v-if="msg.role === 'user'">{{ msg.content }}</div>
+                        <div v-else>
+                            <div class="answer-box" v-html="renderMarkdown(msg.content)"></div>
+                            <div v-if="msg.timing" class="timing-badge">
+                                <span>🔍 向量化 {{ msg.timing.embedding_ms }}ms</span>
+                                <span>📡 检索 {{ msg.timing.search_ms }}ms</span>
+                                <span>🤖 生成 {{ msg.timing.llm_s }}s</span>
+                            </div>
+                            <div v-if="msg.sources && msg.sources.length" class="source-list">
+                                <h4>📄 引用来源 ({{ msg.sources.length }})</h4>
+                                <div v-for="(s, i) in msg.sources" :key="i"
+                                    class="source-item" :class="{ open: expandedMsgIdx === mIdx && expandedIdx === i }"
+                                    @click="toggleSource(mIdx, i)">
+                                    <div class="source-header">
+                                        <span>{{ s.file_name }}</span>
+                                        <span class="badge">相关度 {{ s.score }}</span>
+                                    </div>
+                                    <div class="source-content" v-html="renderMarkdown(s.content)"></div>
+                                </div>
+                            </div>
+                            <button v-if="msg.sources && msg.sources.length"
+                                class="btn-full-doc" @click="retrieveFullDoc(msg)">
+                                📄 查看完整文档
+                            </button>
                         </div>
-                        <div class="source-content" v-html="renderMarkdown(s.content)"></div>
                     </div>
+                </div>
+                <div v-if="loading" class="loading">
+                    <div class="spinner"></div>
+                    <p>正在检索知识库...</p>
                 </div>
             </div>
 
             <!-- 空状态 -->
-            <div v-else class="empty-state">💡 输入问题，基于知识库智能回答</div>
+            <div v-else-if="!loading" class="empty-state">💡 输入问题，基于知识库智能回答</div>
             <div v-if="error" class="error-msg">{{ error }}</div>
         </div>
 
@@ -202,7 +223,23 @@ app.component('chat-panel', {
         </div>
     </div>
     `,
-    data() { return { question: '', answer: '', sources: [], timing: null, loading: false, error: '', expandedIdx: -1 }; },
+    data() {
+        const sid = this._newSessionId();
+        return {
+            question: '',
+            messages: [],
+            sessions: this._loadSessions(),
+            currentSessionId: sid,
+            loading: false,
+            error: '',
+            expandedIdx: -1,
+            expandedMsgIdx: -1,
+            maxHistory: 10
+        };
+    },
+    mounted() {
+        this.saveSession(true);
+    },
     methods: {
         renderMarkdown(text) {
             if (!text) return '';
@@ -212,23 +249,146 @@ app.component('chat-panel', {
                 headerIds: false
             });
             const clean = DOMPurify.sanitize(raw, { USE_PROFILES: { html: true } });
-            // 高亮当前组件内新增的代码块
             nextTick(() => {
                 this.$el.querySelectorAll('.answer-box pre code, .source-content pre code')
                     .forEach(block => hljs.highlightElement(block));
             });
             return clean;
         },
-        async doQuery() {
+        toggleSource(mIdx, i) {
+            if (this.expandedMsgIdx === mIdx && this.expandedIdx === i) {
+                this.expandedMsgIdx = -1;
+                this.expandedIdx = -1;
+            } else {
+                this.expandedMsgIdx = mIdx;
+                this.expandedIdx = i;
+            }
+        },
+        async doQuery(retrieveFullDoc = false) {
             if (!this.question.trim() || !this.apiConfig.apiKey) return;
-            this.loading = true; this.error = ''; this.answer = ''; this.sources = []; this.expandedIdx = -1;
+            const q = this.question.trim();
+            this.messages.push({ id: Date.now(), role: 'user', content: q, timestamp: Date.now() });
+            this.question = '';
+            this.loading = true; this.error = '';
+            this.scrollToBottom();
+
+            const history = this.messages
+                .filter(m => m.role === 'user' || m.role === 'assistant')
+                .slice(-(this.maxHistory * 2))
+                .map(m => ({ role: m.role, content: m.content }));
+
             try {
-                const body = { question: this.question, api_key: this.apiConfig.apiKey, provider: this.apiConfig.provider, model: this.apiConfig.model || null, top_k: 5 };
+                const body = {
+                    question: q,
+                    api_key: this.apiConfig.apiKey,
+                    provider: this.apiConfig.provider,
+                    model: this.apiConfig.model || null,
+                    top_k: 5,
+                    history,
+                    session_id: this.currentSessionId,
+                    retrieve_full_doc: retrieveFullDoc
+                };
                 if (this.apiConfig.baseUrl) body.base_url = this.apiConfig.baseUrl;
                 const r = await ApiClient.query(body);
-                this.answer = r.answer; this.sources = r.sources || []; this.timing = r.timing || null;
-            } catch (e) { this.error = e.message; this.$emit('notify', e.message, 'error'); }
-            finally { this.loading = false; }
+                this.messages.push({
+                    id: Date.now() + 1,
+                    role: 'assistant',
+                    content: r.answer,
+                    sources: r.sources || [],
+                    timing: r.timing || null,
+                    timestamp: Date.now()
+                });
+                this.saveSession();
+            } catch (e) {
+                this.error = e.message;
+                this.$emit('notify', e.message, 'error');
+            } finally {
+                this.loading = false;
+                this.scrollToBottom();
+            }
+        },
+        async retrieveFullDoc(lastMsg) {
+            if (!lastMsg || !lastMsg.sources || !lastMsg.sources.length) return;
+            const idx = this.messages.indexOf(lastMsg);
+            if (idx < 0) return;
+            const q = this.messages.slice(0, idx).reverse().find(m => m.role === 'user');
+            if (!q) return;
+            this.loading = true; this.error = '';
+            try {
+                const body = {
+                    question: q.content,
+                    api_key: this.apiConfig.apiKey,
+                    provider: this.apiConfig.provider,
+                    model: this.apiConfig.model || null,
+                    top_k: 5,
+                    history: [],
+                    session_id: this.currentSessionId,
+                    retrieve_full_doc: true
+                };
+                if (this.apiConfig.baseUrl) body.base_url = this.apiConfig.baseUrl;
+                const r = await ApiClient.query(body);
+                lastMsg.content = r.answer;
+                lastMsg.sources = r.sources || [];
+                lastMsg.timing = r.timing || null;
+                this.saveSession();
+                this.$emit('notify', '已基于完整文档重新生成答案');
+            } catch (e) {
+                this.error = e.message;
+                this.$emit('notify', e.message, 'error');
+            } finally {
+                this.loading = false;
+            }
+        },
+        newSession() {
+            this.currentSessionId = this._newSessionId();
+            this.messages = [];
+            this.error = '';
+            this.question = '';
+            this.expandedIdx = -1;
+            this.expandedMsgIdx = -1;
+            this.saveSession(true);
+        },
+        loadSession(id) {
+            const s = this.sessions.find(s => s.id === id);
+            if (s) {
+                this.currentSessionId = id;
+                this.messages = s.messages || [];
+                this.error = '';
+                this.expandedIdx = -1;
+                this.expandedMsgIdx = -1;
+            }
+        },
+        saveSession(isNew = false) {
+            const sessions = this._loadSessions();
+            const idx = sessions.findIndex(s => s.id === this.currentSessionId);
+            const session = {
+                id: this.currentSessionId,
+                title: this._genTitle(this.messages),
+                messages: this.messages,
+                update_time: Date.now()
+            };
+            if (idx >= 0) sessions[idx] = session;
+            else sessions.unshift(session);
+            sessions.sort((a, b) => b.update_time - a.update_time);
+            localStorage.setItem('rag_sessions', JSON.stringify(sessions.slice(0, 50)));
+            this.sessions = sessions.slice(0, 50);
+        },
+        _loadSessions() {
+            try { return JSON.parse(localStorage.getItem('rag_sessions') || '[]'); }
+            catch (e) { return []; }
+        },
+        _newSessionId() {
+            return 's_' + Math.random().toString(36).slice(2, 10) + '_' + Date.now();
+        },
+        _genTitle(messages) {
+            const first = messages.find(m => m.role === 'user');
+            return first ? first.content.slice(0, 20) + (first.content.length > 20 ? '...' : '') : '新对话';
+        },
+        scrollToBottom() {
+            nextTick(() => {
+                const el = this.$refs.messageList;
+                if (el) el.scrollTop = el.scrollHeight;
+            });
         }
     }
 });

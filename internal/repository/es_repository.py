@@ -76,6 +76,9 @@ class ESRepository:
                     "chunk_index": {"type": "integer"},
                     "char_count": {"type": "integer"},
                     "upload_time": {"type": "date"},
+                    "full_text": {"type": "text", "analyzer": "standard"},
+                    "is_full_doc": {"type": "boolean"},
+                    "doc_id": {"type": "keyword"},
                     "vector": {
                         "type": "dense_vector",
                         "element_type": "float",
@@ -91,6 +94,30 @@ class ESRepository:
             }
         }
         return es.indices.create(index=index, body=mapping, ignore=400)
+
+    def _ensure_full_doc_fields(self):
+        """
+        兼容旧索引：动态添加整篇文档召回所需字段。
+        ES 8.x 支持向已有 mapping 添加字段，不会丢失数据。
+        """
+        es = self.connect()
+        try:
+            mapping = es.indices.get_mapping(index=self.index)
+            props = mapping.get(self.index, {}).get("mappings", {}).get("properties", {})
+            missing = []
+            for field, ftype in [("full_text", {"type": "text", "analyzer": "standard"}),
+                                 ("is_full_doc", {"type": "boolean"}),
+                                 ("doc_id", {"type": "keyword"})]:
+                if field not in props:
+                    missing.append((field, ftype))
+            if missing:
+                body = {"properties": {field: ftype for field, ftype in missing}}
+                es.indices.put_mapping(index=self.index, body=body)
+                self.logger.info("es_repository", "_ensure_full_doc_fields",
+                                 f"已动态添加字段: {[f for f, _ in missing]}")
+        except Exception as e:
+            self.logger.warn("es_repository", "_ensure_full_doc_fields",
+                             "动态添加字段失败", error=str(e)[:200])
 
     def delete_index(self, index_name: str = None) -> Dict:
         es = self.connect()
@@ -108,6 +135,8 @@ class ESRepository:
         """
         if not self.index_exists():
             self.create_index()
+        else:
+            self._ensure_full_doc_fields()
     def bulk_insert(self, chunks: List[Dict], vectors: np.ndarray) -> int:
         """
         批量写入 - 面试点：为什么用 bulk 而不是逐条 index？
@@ -126,18 +155,23 @@ class ESRepository:
         now = datetime.now().isoformat()
 
         for chunk, vector in zip(chunks, vectors):
+            source = {
+                "chunk_id": chunk["chunk_id"],
+                "content": chunk["content"],
+                "file_name": chunk["file_name"],
+                "chunk_index": chunk.get("chunk_index", 0),
+                "char_count": chunk.get("char_count", len(chunk["content"])),
+                "upload_time": chunk.get("upload_time", now),
+                "vector": vector.tolist()
+            }
+            if chunk.get("is_full_doc"):
+                source["is_full_doc"] = True
+                source["full_text"] = chunk.get("full_text", chunk["content"])
+                source["doc_id"] = chunk.get("doc_id", chunk["file_name"])
             actions.append({
                 "_index": index,
                 "_id": chunk.get("chunk_id"),
-                "_source": {
-                    "chunk_id": chunk["chunk_id"],
-                    "content": chunk["content"],
-                    "file_name": chunk["file_name"],
-                    "chunk_index": chunk.get("chunk_index", 0),
-                    "char_count": chunk.get("char_count", len(chunk["content"])),
-                    "upload_time": chunk.get("upload_time", now),
-                    "vector": vector.tolist()
-                }
+                "_source": source
             })
 
         success, failed = bulk(es, actions, raise_on_error=False,
@@ -149,6 +183,34 @@ class ESRepository:
         # 强制刷新，让新数据立即可搜索
         es.indices.refresh(index=index)
         return success
+
+    def get_full_document(self, file_name: str) -> Optional[Dict]:
+        """通过 file_name 查询整篇文档"""
+        es = self.connect()
+        body = {
+            "size": 1,
+            "query": {
+                "bool": {
+                    "must": [
+                        {"term": {"is_full_doc": True}},
+                        {"term": {"file_name": file_name}}
+                    ]
+                }
+            },
+            "_source": ["chunk_id", "content", "full_text", "file_name", "upload_time", "char_count"]
+        }
+        response = es.search(index=self.index, body=body)
+        hits = response["hits"]["hits"]
+        if not hits:
+            return None
+        src = hits[0]["_source"]
+        return {
+            "chunk_id": src.get("chunk_id"),
+            "content": src.get("full_text") or src.get("content", ""),
+            "file_name": src.get("file_name"),
+            "score": 0,
+            "is_full_doc": True
+        }
 
     # ---------- 数据检索 ----------
     def search_by_vector(self, query_vector: np.ndarray, size: int = 10) -> List[Dict]:

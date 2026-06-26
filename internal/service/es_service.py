@@ -101,6 +101,10 @@ class ESService:
             return results
         return [r for r in results if r.get("score", 0) >= min_score]
 
+    def retrieve_full_document(self, file_name: str) -> Optional[Dict]:
+        """通过 file_name 召回整篇文档"""
+        return self.repo.get_full_document(file_name)
+
     # ---------- 索引管理 ----------
     def ensure_index(self) -> bool:
         """确保索引存在，不存在则创建"""

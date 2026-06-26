@@ -12,10 +12,21 @@ class ApiClient {
      * POST /api/query - RAG 问答
      */
     static async query(body) {
+        const payload = {
+            question: body.question,
+            api_key: body.api_key,
+            provider: body.provider,
+            model: body.model,
+            base_url: body.base_url,
+            top_k: body.top_k || 5,
+            history: body.history || [],
+            session_id: body.session_id || null,
+            retrieve_full_doc: body.retrieve_full_doc || false
+        };
         const res = await fetch(`${API_BASE}/api/query`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
+            body: JSON.stringify(payload)
         });
         return ApiClient._handleResponse(res);
     }

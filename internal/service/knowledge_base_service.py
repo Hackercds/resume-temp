@@ -41,6 +41,8 @@ class KnowledgeBaseService:
         3. 批量向量化 → vectors
         4. 写入 ES
         """
+        from datetime import datetime
+
         # Step 0: 同名文件覆盖策略（删旧写新，保证幂等）
         deleted = self.es.delete_by_file_name(file_name)
         if deleted > 0:
@@ -59,10 +61,8 @@ class KnowledgeBaseService:
 
         # Step 2: 分块
         if ext == '.csv':
-            # CSV 按行分块
             chunks = self.chunk.chunk_csv(text, file_name)
         else:
-            # 使用指定参数或默认参数
             if chunk_size is not None:
                 self.chunk.chunk_size = chunk_size
             if overlap is not None:
@@ -72,11 +72,26 @@ class KnowledgeBaseService:
         if not chunks:
             raise ValueError(f"文本分块后无内容: {file_name}")
 
+        # Step 2.5: 附加整篇文档父文档
+        now = datetime.now().isoformat()
+        parent_chunk = {
+            "chunk_id": f"{file_name}__full_doc",
+            "content": text[:self.chunk.chunk_size] if len(text) > self.chunk.chunk_size else text,
+            "file_name": file_name,
+            "chunk_index": -1,
+            "char_count": len(text),
+            "is_full_doc": True,
+            "full_text": text,
+            "doc_id": file_name,
+            "upload_time": now
+        }
+        chunks.append(parent_chunk)
+
         self.logger.info("ingest", "knowledge_base",
                          "Step2 文本分块完成",
-                         file_name=file_name, chunks=len(chunks))
+                         file_name=file_name, chunks=len(chunks) - 1)
 
-        # Step 3: 批量向量化
+        # Step 3: 批量向量化（包含父文档）
         texts = [c["content"] for c in chunks]
         vectors = self.embedding.encode_batch(texts)
 

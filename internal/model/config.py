@@ -60,6 +60,13 @@ class RerankConfig(BaseModel):
 class RetrievalConfig(BaseModel):
     top_k: int = 5
     min_score: float = 0.5
+    enable_full_document: bool = True
+
+
+class ConversationConfig(BaseModel):
+    max_history: int = 10
+    context_window: int = 8000
+    enable_full_document: bool = True
 
 
 class CorsConfig(BaseModel):
@@ -80,6 +87,7 @@ class Config(BaseModel):
     llm: LLMConfig = LLMConfig()
     rerank: RerankConfig = RerankConfig()
     retrieval: RetrievalConfig = RetrievalConfig()
+    conversation: ConversationConfig = ConversationConfig()
     cors: CorsConfig = CorsConfig()
 
 

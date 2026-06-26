@@ -147,7 +147,9 @@ async def rag_query(request: Request, body: QueryRequest):
             provider=body.provider,
             model=body.model,
             base_url=body.base_url,
-            top_k=body.top_k
+            top_k=body.top_k,
+            history=[m.model_dump() for m in body.history] if body.history else None,
+            retrieve_full_doc=body.retrieve_full_doc
         )
 
         # 构造 sources

@@ -39,6 +39,13 @@ class APIResponse(BaseModel):
 
 
 # ---------- 查询请求 ----------
+class ChatMessage(BaseModel):
+    """对话历史消息"""
+    role: str = Field(..., pattern=r"^(user|assistant|system)$",
+                      description="消息角色: user / assistant / system")
+    content: str = Field(..., min_length=1, description="消息内容")
+
+
 class QueryRequest(BaseModel):
     """面试点：API Key 透传，后端不存储"""
     question: str = Field(..., min_length=1, max_length=2000,
@@ -49,6 +56,9 @@ class QueryRequest(BaseModel):
     model: Optional[str] = Field(default=None, description="模型名，支持自由输入")
     base_url: Optional[str] = Field(default=None, description="自定义 API 地址，如 https://api.deepseek.com/v1")
     top_k: int = Field(default=5, ge=1, le=20, description="检索Top-K")
+    history: List[ChatMessage] = Field(default_factory=list, description="历史对话消息")
+    session_id: Optional[str] = Field(default=None, description="会话ID，可选")
+    retrieve_full_doc: bool = Field(default=False, description="是否强制召回整篇文档")
 
 
 # ---------- 查询响应 ----------

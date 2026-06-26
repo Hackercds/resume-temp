@@ -26,6 +26,9 @@ from internal.service.rerank_service import RerankService
 class RAGService:
     """RAG 核心编排服务 - 面试点：全链路如何串联？"""
 
+    # LLM 请求查看完整文档的标记
+    _RETRIEVE_MARK = re.compile(r"\{\{retrieve_full_doc:([^}]+)\}\}")
+
     def __init__(self,
                  embedding_service: EmbeddingService = None,
                  es_service: ESService = None,
@@ -39,7 +42,9 @@ class RAGService:
 
     def query(self, question: str, api_key: str,
               provider: str = "openai", model: str = None,
-              base_url: str = None, top_k: int = 5) -> Dict:
+              base_url: str = None, top_k: int = 5,
+              history: List[Dict] = None,
+              retrieve_full_doc: bool = False) -> Dict:
         """
         RAG 查询主流程 - 面试点：全链路耗时分布
         1. embedding 推理: ~50-200ms (CPU)
@@ -61,7 +66,9 @@ class RAGService:
             # 降级到纯 BM25
             self.logger.warn(trace_id, "rag_service",
                              "Embedding加载失败，降级到 BM25 检索")
-            return self._query_bm25_fallback(question, api_key, provider, model, top_k, trace_id)
+            return self._query_bm25_fallback(question, api_key, provider, model,
+                                             top_k, trace_id, history=history,
+                                             retrieve_full_doc=retrieve_full_doc)
         embed_time = (time.time() - embed_start) * 1000
         timing["embedding_ms"] = round(embed_time, 1)
         self.logger.info(trace_id, "rag_service",
@@ -99,9 +106,6 @@ class RAGService:
             candidates = candidates[:top_k]
 
         # Step 4: 空检索 / 低质量结果 → 尝试多实体分解检索
-        # ⚠️ 触发条件严格：1) 结果<3条  2) 问题含≥2个人名
-        # 正常查询完全跳过此步骤，时延影响 = 0
-        # 面试点：为什么不每次都做？时延 × N，99% 的查询不需要
         if not candidates or len(candidates) < 3:
             entities = self._extract_entities(question)
             if len(entities) >= 2:
@@ -110,7 +114,6 @@ class RAGService:
                                  entities=entities, original_count=len(candidates))
                 decomposed = self._multi_entity_retrieve(question, entities, top_k)
                 if decomposed:
-                    # 合并原始结果和分解检索结果
                     seen = {c["chunk_id"] for c in candidates}
                     for c in decomposed:
                         if c["chunk_id"] not in seen:
@@ -132,10 +135,18 @@ class RAGService:
                 "timing": timing
             }
 
-        # Step 6: 拼接上下文
+        # Step 6: 用户手动触发整篇文档召回
+        if retrieve_full_doc and get_config().retrieval.enable_full_document:
+            full_docs = self._retrieve_full_documents(
+                list({c["file_name"] for c in candidates})
+            )
+            if full_docs:
+                candidates = full_docs
+
+        # Step 7: 拼接上下文
         context = self._build_context(candidates)
 
-        # Step 7: 调用 LLM 生成
+        # Step 8: 调用 LLM 生成
         llm_start = time.time()
         try:
             answer = self.llm.generate(
@@ -144,7 +155,9 @@ class RAGService:
                 api_key=api_key,
                 provider=provider,
                 model=model,
-                base_url=base_url
+                base_url=base_url,
+                history=history,
+                allow_full_doc_retrieval=(not retrieve_full_doc)
             )
         except LLMAPIError as e:
             # LLM 失败时返回检索到的原始内容
@@ -153,11 +166,36 @@ class RAGService:
         llm_time = time.time() - llm_start
         timing["llm_s"] = round(llm_time, 1)
         self.logger.info(trace_id, "rag_service",
-                         "Step7 LLM 生成完成",
+                         "Step8 LLM 生成完成",
                          duration_s=round(llm_time, 1))
 
+        # Step 9: 检测 LLM 是否请求查看完整文档
+        requested_file = self._need_full_document(answer)
+        if requested_file and not retrieve_full_doc and get_config().retrieval.enable_full_document:
+            self.logger.info(trace_id, "rag_service",
+                             "LLM 请求召回整篇文档", file_name=requested_file)
+            full_docs = self._retrieve_full_documents([requested_file])
+            if full_docs:
+                full_context = self._build_context(full_docs)
+                try:
+                    answer = self.llm.generate(
+                        question=question,
+                        context=full_context,
+                        api_key=api_key,
+                        provider=provider,
+                        model=model,
+                        base_url=base_url,
+                        history=history,
+                        allow_full_doc_retrieval=False  # 避免无限循环
+                    )
+                    candidates = full_docs
+                    timing["full_doc_retrieval"] = True
+                except LLMAPIError as e:
+                    self.logger.error(trace_id, "rag_service",
+                                      "整篇文档重新生成失败", error=str(e))
+
         # 构造返回
-        total_time_ms = sum(v for k, v in timing.items())
+        total_time_ms = sum(v for k, v in timing.items() if isinstance(v, (int, float)))
         self.logger.info(trace_id, "rag_service",
                          "RAG 查询完成",
                          total_ms=round(total_time_ms, 1),
@@ -179,7 +217,9 @@ class RAGService:
 
     def _query_bm25_fallback(self, question: str, api_key: str,
                              provider: str, model: str,
-                             top_k: int, trace_id: str) -> Dict:
+                             top_k: int, trace_id: str,
+                             history: List[Dict] = None,
+                             retrieve_full_doc: bool = False) -> Dict:
         """
         BM25 降级方案 - 面试点：即使 embedding 不可用，基本搜索仍可用
         """
@@ -202,10 +242,18 @@ class RAGService:
                 "fallback": True
             }
 
+        if retrieve_full_doc:
+            full_docs = self._retrieve_full_documents(
+                list({r["file_name"] for r in results})
+            )
+            if full_docs:
+                results = full_docs
+
         # 降级模式下也尝试调用 LLM（如果有 API Key）
         context = self._build_context(results)
         try:
-            answer = self.llm.generate(question, context, api_key, provider, model)
+            answer = self.llm.generate(question, context, api_key, provider, model,
+                                       history=history)
         except Exception:
             # LLM 也不可用时直接返回检索内容
             answer = f"[降级模式-关键词匹配]\n\n{context}"
@@ -228,11 +276,32 @@ class RAGService:
         context_parts = []
         for i, c in enumerate(candidates, 1):
             score = c.get("rerank_score", c.get("score", 0))
+            label = "【完整文档】" if c.get("is_full_doc") else f"【来源{i}】"
             context_parts.append(
-                f"【来源{i}】{c['file_name']} (相关度: {score:.2f})\n"
+                f"{label}{c['file_name']} (相关度: {score:.2f})\n"
                 f"内容: {c['content']}"
             )
         return "\n\n".join(context_parts)
+
+    def _need_full_document(self, answer: str) -> Optional[str]:
+        """检测 LLM 是否请求查看完整文档"""
+        m = self._RETRIEVE_MARK.search(answer)
+        if m:
+            return m.group(1).strip()
+        return None
+
+    def _retrieve_full_documents(self, file_names: List[str]) -> List[Dict]:
+        """按 file_name 召回整篇文档"""
+        results = []
+        seen = set()
+        for fn in file_names:
+            if fn in seen:
+                continue
+            doc = self.es.retrieve_full_document(fn)
+            if doc:
+                seen.add(fn)
+                results.append(doc)
+        return results
 
     # ==================== 查询分解检索 ====================
 

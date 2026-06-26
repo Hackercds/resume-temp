@@ -5,7 +5,7 @@ LLM API 调用服务 - 面试核心问题：
 3. Prompt 设计要点？角色设定 + 已知信息 + 回答约束
 """
 import json
-from typing import Dict
+from typing import Dict, List
 
 import httpx
 
@@ -32,7 +32,9 @@ class LLMService:
 
     def generate(self, question: str, context: str,
                  api_key: str, provider: str = "openai",
-                 model: str = None, base_url: str = None) -> str:
+                 model: str = None, base_url: str = None,
+                 history: List[Dict] = None,
+                 allow_full_doc_retrieval: bool = True) -> str:
         """
         统一生成接口 - 面试点：Provider 切换只需传参
         base_url: 自定义 API 地址（兼容 DeepSeek / 豆包 / 本地模型等）
@@ -41,20 +43,21 @@ class LLMService:
         llm_cfg = cfg.llm
         provider = provider or llm_cfg.default_provider
         model = model or llm_cfg.default_model
-        prompt = self._build_prompt(question, context)
 
-        if provider == "openai":
-            return self._call_openai(api_key, model, prompt, base_url)
+        if provider == "openai" or provider == "custom":
+            return self._call_openai(api_key, model, question, context,
+                                     base_url, history, allow_full_doc_retrieval)
         elif provider == "anthropic":
-            return self._call_anthropic(api_key, model, prompt, base_url)
-        elif provider == "custom":
-            # custom → 用 OpenAI 兼容协议 + 自定义 base_url
-            return self._call_openai(api_key, model, prompt, base_url)
+            return self._call_anthropic(api_key, model, question, context,
+                                        base_url, history, allow_full_doc_retrieval)
         else:
             raise LLMAPIError(f"不支持的 Provider: {provider}，可选 openai / anthropic / custom")
 
-    def _call_openai(self, api_key: str, model: str, prompt: str,
-                     base_url: str = None) -> str:
+    def _call_openai(self, api_key: str, model: str,
+                     question: str, context: str,
+                     base_url: str = None,
+                     history: List[Dict] = None,
+                     allow_full_doc_retrieval: bool = True) -> str:
         """
         OpenAI 兼容 API 调用
         base_url: 自定义 API 地址，如 https://api.deepseek.com/v1
@@ -68,13 +71,23 @@ class LLMService:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
+
+        messages = [
+            {"role": "system",
+             "content": "你是一个专业的知识库问答助手。请严格基于知识库内容回答，不要编造信息。"}
+        ]
+        if history:
+            for m in history:
+                if m.get("role") in ("user", "assistant") and m.get("content"):
+                    messages.append({"role": m["role"], "content": m["content"]})
+
+        user_prompt = self._build_prompt(question, context,
+                                         allow_full_doc_retrieval=allow_full_doc_retrieval)
+        messages.append({"role": "user", "content": user_prompt})
+
         body = {
             "model": model,
-            "messages": [
-                {"role": "system",
-                 "content": "你是一个专业的知识库问答助手。请严格基于知识库内容回答，不要编造信息。"},
-                {"role": "user", "content": prompt}
-            ],
+            "messages": messages,
             "temperature": self.default_temperature,
             "max_tokens": self.default_max_tokens,
         }
@@ -103,8 +116,11 @@ class LLMService:
         except Exception as e:
             raise LLMAPIError(f"API 调用异常: {str(e)}")
 
-    def _call_anthropic(self, api_key: str, model: str, prompt: str,
-                         base_url: str = None) -> str:
+    def _call_anthropic(self, api_key: str, model: str,
+                        question: str, context: str,
+                        base_url: str = None,
+                        history: List[Dict] = None,
+                        allow_full_doc_retrieval: bool = True) -> str:
         """Anthropic API 调用"""
         if base_url:
             url = base_url.rstrip("/") + "/messages"
@@ -115,14 +131,23 @@ class LLMService:
             "anthropic-version": "2023-06-01",
             "Content-Type": "application/json",
         }
+
+        messages = []
+        if history:
+            for m in history:
+                if m.get("role") in ("user", "assistant") and m.get("content"):
+                    messages.append({"role": m["role"], "content": m["content"]})
+
+        user_prompt = self._build_prompt(question, context,
+                                         allow_full_doc_retrieval=allow_full_doc_retrieval)
+        messages.append({"role": "user", "content": user_prompt})
+
         body = {
             "model": model,
             "max_tokens": self.default_max_tokens,
             "temperature": self.default_temperature,
             "system": "你是一个专业的知识库问答助手。请严格基于知识库内容回答，不要编造信息。",
-            "messages": [
-                {"role": "user", "content": prompt}
-            ]
+            "messages": messages
         }
 
         try:
@@ -147,7 +172,8 @@ class LLMService:
         except Exception as e:
             raise LLMAPIError(f"API 调用异常: {str(e)}")
 
-    def _build_prompt(self, question: str, context: str) -> str:
+    def _build_prompt(self, question: str, context: str,
+                      allow_full_doc_retrieval: bool = True) -> str:
         """
         Prompt 工程 - 面试点：RAG prompt 设计要点？
         1. 给 LLM 明确角色：知识库问答助手
@@ -158,6 +184,14 @@ class LLMService:
            - 不要编造信息
         4. 控制 prompt 长度：避免超过模型上下文窗口
         """
+        full_doc_hint = ""
+        if allow_full_doc_retrieval:
+            full_doc_hint = """
+5. 如果当前检索到的片段信息不完整、不足以准确回答，你可以请求查看完整文档。
+   请求格式必须严格为：{{retrieve_full_doc:文件名}}
+   例如：{{retrieve_full_doc:张三简历.pdf}}
+   只需要输出这一行标记，系统会自动召回该文件完整内容并重新生成答案。"""
+
         return f"""已知信息（来自知识库检索，可能有不准确之处，请结合上下文判断）：
 
 {context}
@@ -168,4 +202,4 @@ class LLMService:
 1. 如果知识库中有明确相关信息，请基于已知信息回答，并引用对应的来源编号
 2. 如果知识库中完全没有相关信息，请如实说明"知识库中未找到相关内容"
 3. 回答要简洁准确，不要编造知识库中没有的信息
-4. 回答使用中文"""
+4. 回答使用中文{full_doc_hint}"""
