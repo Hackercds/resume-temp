@@ -202,7 +202,7 @@ async def upload_document(
 
     # 校验文件格式
     ext = "." + file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
-    allowed = {".pdf", ".txt", ".csv"}
+    allowed = {".pdf", ".txt", ".csv", ".md", ".markdown"}
     if ext not in allowed:
         return APIResponse.error(40002,
                                  f"不支持的文件格式: {ext}，仅支持 {allowed}",

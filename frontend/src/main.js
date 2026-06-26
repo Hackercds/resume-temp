@@ -166,7 +166,7 @@ app.component('chat-panel', {
                     <span>📡 检索 {{ timing.search_ms }}ms</span>
                     <span>🤖 生成 {{ timing.llm_s }}s</span>
                 </div>
-                <div class="answer-box">{{ answer }}</div>
+                <div class="answer-box" v-html="renderMarkdown(answer)"></div>
 
                 <div v-if="sources.length" class="source-list">
                     <h4>📄 引用来源 ({{ sources.length }})</h4>
@@ -177,7 +177,7 @@ app.component('chat-panel', {
                             <span>{{ s.file_name }}</span>
                             <span class="badge">相关度 {{ s.score }}</span>
                         </div>
-                        <div class="source-content">{{ s.content }}</div>
+                        <div class="source-content" v-html="renderMarkdown(s.content)"></div>
                     </div>
                 </div>
             </div>
@@ -204,6 +204,21 @@ app.component('chat-panel', {
     `,
     data() { return { question: '', answer: '', sources: [], timing: null, loading: false, error: '', expandedIdx: -1 }; },
     methods: {
+        renderMarkdown(text) {
+            if (!text) return '';
+            const raw = marked.parse(String(text), {
+                gfm: true,
+                breaks: true,
+                headerIds: false
+            });
+            const clean = DOMPurify.sanitize(raw, { USE_PROFILES: { html: true } });
+            // 高亮当前组件内新增的代码块
+            nextTick(() => {
+                this.$el.querySelectorAll('.answer-box pre code, .source-content pre code')
+                    .forEach(block => hljs.highlightElement(block));
+            });
+            return clean;
+        },
         async doQuery() {
             if (!this.question.trim() || !this.apiConfig.apiKey) return;
             this.loading = true; this.error = ''; this.answer = ''; this.sources = []; this.expandedIdx = -1;
@@ -230,9 +245,9 @@ app.component('knowledge-panel', {
                 @dragover.prevent="isDragOver = true" @dragleave="isDragOver = false"
                 @drop.prevent="handleDrop" @click="$refs.fi.click()">
                 <div class="upload-icon">📄</div>
-                <p>点击或拖拽 PDF / TXT / CSV 文件到此处</p>
-                <p class="upload-limit">最大 10MB</p>
-                <input type="file" ref="fi" accept=".pdf,.txt,.csv" @change="handleFileSelect" hidden />
+                <p>点击或拖拽 PDF / TXT / CSV / Markdown 文件到此处</p>
+                <p class="upload-limit">最大 10MB · 支持多个文件</p>
+                <input type="file" ref="fi" accept=".pdf,.txt,.csv,.md,.markdown" multiple @change="handleFileSelect" hidden />
             </div>
             <div v-if="uploading">
                 <div class="progress-bar"><div class="progress-fill" :style="{width:uploadProgress+'%'}"></div></div>
@@ -268,24 +283,58 @@ app.component('knowledge-panel', {
             catch (e) { /* 索引为空时忽略 */ }
             this.loading = false;
         },
-        handleFileSelect(e) { const f = e.target.files[0]; if (f) this.upload(f); },
-        handleDrop(e) { this.isDragOver = false; const f = e.dataTransfer.files[0]; if (f) this.upload(f); },
-        async upload(file) {
-            const ext = '.' + file.name.split('.').pop().toLowerCase();
-            if (!['.pdf','.txt','.csv'].includes(ext)) { this.$emit('notify', '仅支持 PDF/TXT/CSV', 'error'); return; }
-            if (file.size > 10*1024*1024) { this.$emit('notify', '超过 10MB 限制', 'error'); return; }
+        handleFileSelect(e) {
+            const files = Array.from(e.target.files || []);
+            if (files.length) this.uploadFiles(files);
+            e.target.value = ''; // 允许重复选择同一文件
+        },
+        handleDrop(e) {
+            this.isDragOver = false;
+            const files = Array.from(e.dataTransfer.files || []);
+            if (files.length) this.uploadFiles(files);
+        },
+        async uploadFiles(files) {
+            const validExts = ['.pdf','.txt','.csv','.md','.markdown'];
+            const validFiles = files.filter(f => {
+                const ext = '.' + f.name.split('.').pop().toLowerCase();
+                if (!validExts.includes(ext)) {
+                    this.$emit('notify', `跳过「${f.name}」：仅支持 PDF/TXT/CSV/Markdown`, 'error');
+                    return false;
+                }
+                if (f.size > 10 * 1024 * 1024) {
+                    this.$emit('notify', `跳过「${f.name}」：超过 10MB 限制`, 'error');
+                    return false;
+                }
+                return true;
+            });
+            if (!validFiles.length) return;
+
             this.uploading = true; this.uploadProgress = 5;
             const t = setInterval(() => { if (this.uploadProgress < 85) this.uploadProgress += 8; }, 600);
-            try {
-                const fd = new FormData(); fd.append('file', file);
-                const r = await ApiClient.uploadDocument(fd);
-                clearInterval(t); this.uploadProgress = 100;
-                const msg = r.replaced
-                    ? `✓ 已更新「${r.file_name}」（替换 ${r.replaced_chunks} → ${r.chunks_created} 个分块）`
-                    : `✓ 上传成功，${r.chunks_created} 个分块已入库`;
-                this.$emit('notify', msg);
-                await this.load();
-            } catch (e) { clearInterval(t); this.$emit('notify', '上传失败: ' + e.message, 'error'); }
+
+            let successCount = 0;
+            let failCount = 0;
+            for (const file of validFiles) {
+                try {
+                    const fd = new FormData(); fd.append('file', file);
+                    const r = await ApiClient.uploadDocument(fd);
+                    successCount++;
+                    const msg = r.replaced
+                        ? `✓ 已更新「${r.file_name}」（替换 ${r.replaced_chunks} → ${r.chunks_created} 个分块）`
+                        : `✓ 上传成功「${r.file_name}」，${r.chunks_created} 个分块已入库`;
+                    this.$emit('notify', msg);
+                } catch (e) {
+                    failCount++;
+                    this.$emit('notify', `「${file.name}」上传失败: ${e.message}`, 'error');
+                }
+            }
+            clearInterval(t); this.uploadProgress = 100;
+            if (successCount) await this.load();
+            if (failCount === 0) {
+                this.$emit('notify', `全部完成：${successCount} 个文件上传成功`);
+            } else {
+                this.$emit('notify', `完成：${successCount} 成功，${failCount} 失败`, 'error');
+            }
             this.uploading = false;
         },
         async remove(name) {

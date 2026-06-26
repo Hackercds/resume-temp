@@ -104,8 +104,76 @@ body {
 /* Answer */
 .answer-box {
     background: var(--bg); border-radius:8px; padding:20px;
-    font-size:15px; line-height:1.8; white-space:pre-wrap; word-break:break-word;
+    font-size:15px; line-height:1.8; word-break:break-word;
 }
+.answer-box, .source-content { white-space: normal; }
+
+.answer-box h1, .answer-box h2, .answer-box h3,
+.answer-box h4, .answer-box h5, .answer-box h6,
+.source-content h1, .source-content h2, .source-content h3,
+.source-content h4, .source-content h5, .source-content h6 {
+    margin: 16px 0 8px;
+    font-weight: 600;
+    line-height: 1.4;
+    color: var(--text);
+}
+.answer-box h1, .source-content h1 { font-size: 1.5em; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+.answer-box h2, .source-content h2 { font-size: 1.3em; }
+.answer-box h3, .source-content h3 { font-size: 1.15em; }
+
+.answer-box p, .source-content p { margin: 8px 0; }
+.answer-box ul, .answer-box ol,
+.source-content ul, .source-content ol {
+    margin: 8px 0 8px 20px;
+    padding-left: 8px;
+}
+.answer-box li, .source-content li { margin: 4px 0; }
+
+.answer-box code, .source-content code {
+    background: #f1f5f9;
+    padding: 2px 5px;
+    border-radius: 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.9em;
+}
+.answer-box pre, .source-content pre {
+    background: #f8fafc;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 16px;
+    overflow-x: auto;
+    margin: 10px 0;
+}
+.answer-box pre code, .source-content pre code {
+    background: transparent;
+    padding: 0;
+    font-size: 0.85em;
+}
+
+.answer-box blockquote, .source-content blockquote {
+    border-left: 4px solid var(--primary);
+    padding-left: 12px;
+    margin: 10px 0;
+    color: var(--text-secondary);
+}
+
+.answer-box table, .source-content table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 12px 0;
+    font-size: 0.95em;
+}
+.answer-box th, .answer-box td,
+.source-content th, .source-content td {
+    border: 1px solid var(--border);
+    padding: 6px 10px;
+    text-align: left;
+}
+.answer-box th, .source-content th { background: #f1f5f9; font-weight: 600; }
+
+.answer-box a, .source-content a { color: var(--primary); text-decoration: none; }
+.answer-box a:hover, .source-content a:hover { text-decoration: underline; }
+
 .timing-badge {
     display:inline-flex; gap:14px; font-size:12px; color:var(--text-secondary);
     margin-bottom:14px; padding:6px 12px; background:#F1F5F9; border-radius:6px;
