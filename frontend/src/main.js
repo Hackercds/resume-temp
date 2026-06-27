@@ -159,7 +159,8 @@ app.component('chat-panel', {
                 <div v-for="s in sessions" :key="s.id"
                      :class="['session-chip', { active: s.id === currentSessionId }]"
                      @click="loadSession(s.id)">
-                    {{ s.title }}
+                    <span class="session-title">{{ s.title }}</span>
+                    <span class="session-delete" @click.stop="deleteSession(s.id)">✕</span>
                 </div>
             </div>
         </div>
@@ -239,7 +240,12 @@ app.component('chat-panel', {
         };
     },
     mounted() {
-        this.saveSession(true);
+        // 不要保存空会话，避免产生一堆"新对话"
+        if (this.messages.length > 0) {
+            this.saveSession(true);
+        } else {
+            this.sessions = this._loadSessions();
+        }
     },
     methods: {
         renderMarkdown(text) {
@@ -405,13 +411,29 @@ app.component('chat-panel', {
             }
         },
         newSession() {
+            // 如果当前会话为空，直接复用不新建
+            if (this.messages.length === 0) return;
             this.currentSessionId = this._newSessionId();
             this.messages = [];
             this.error = '';
             this.question = '';
             this.expandedIdx = -1;
             this.expandedMsgIdx = -1;
-            this.saveSession(true);
+        },
+        deleteSession(id) {
+            if (!confirm('删除该对话？')) return;
+            const sessions = this._loadSessions().filter(s => s.id !== id);
+            localStorage.setItem('rag_sessions', JSON.stringify(sessions.slice(0, 50)));
+            this.sessions = sessions.slice(0, 50);
+            if (this.currentSessionId === id) {
+                this.messages = [];
+                this.error = '';
+                this.question = '';
+                this.expandedIdx = -1;
+                this.expandedMsgIdx = -1;
+                // 重新生成一个空会话 ID，避免后续消息误入已删会话
+                this.currentSessionId = this._newSessionId();
+            }
         },
         loadSession(id) {
             const s = this.sessions.find(s => s.id === id);
@@ -424,6 +446,11 @@ app.component('chat-panel', {
             }
         },
         saveSession(isNew = false) {
+            // 不保存空会话
+            if (this.messages.length === 0) {
+                this.sessions = this._loadSessions();
+                return;
+            }
             const sessions = this._loadSessions();
             const idx = sessions.findIndex(s => s.id === this.currentSessionId);
             const session = {

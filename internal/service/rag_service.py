@@ -56,13 +56,29 @@ class RAGService:
         if not history:
             return "new_topic"
         q = question.lower()
+
+        # 总结/对比意图
         if any(k in q for k in self._SUMMARIZE_KEYWORDS):
             return "summarize"
-        if any(k in q for k in self._FOLLOW_UP_KEYWORDS):
+
+        # 强指代词 → 追问
+        strong_follow_up = {'他', '她', '它', '这个', '那个', '这篇', '这份', '这个文件'}
+        if any(k in q for k in strong_follow_up):
             return "follow_up"
-        # 问题很短且有历史，大概率是追问
+
+        # 问题较长（>=15字）且不含强指代 → 大概率新话题
+        if len(question.strip()) >= 15:
+            return "new_topic"
+
+        # 弱指代词或短问题 → 追问
+        weak_follow_up = {'这', '那', '上文', '前面', '刚才', '接着', '还有', '另外', '除此之外', '那么'}
+        if any(k in q for k in weak_follow_up):
+            return "follow_up"
+
+        # 疑问词开头的短问题也认为是追问
         if len(question.strip()) < 10:
             return "follow_up"
+
         return "new_topic"
 
     def _rewrite_query(self, question: str, intent: str, history: List[Dict]) -> str:
@@ -79,7 +95,10 @@ class RAGService:
         )
 
         if intent == "follow_up":
-            return f"结合前文讨论：\n{context_text}\n\n当前追问：{question}"
+            # 提取前一轮 user 问题的核心实体，补充到追问中
+            prev_user = next((m for m in reversed(recent) if m.get('role') == 'user'), None)
+            prev_topic = prev_user.get('content', '') if prev_user else ''
+            return f"关于「{prev_topic}」的追问：{question}\n\n前文摘要：{context_text[:200]}"
         if intent == "summarize":
             return f"请基于以下内容总结或对比：\n{context_text}\n\n用户要求：{question}"
         if intent == "clarify":
