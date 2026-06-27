@@ -82,17 +82,18 @@ const app = createApp({
 
     template: `
     <div>
-        <!-- Editorial masthead -->
+        <!-- Header -->
         <header class="masthead">
-            <h1 class="masthead-title">简历 <em>RAG</em><br />智能问答</h1>
+            <div class="masthead-title">
+                <span class="masthead-title-icon">✦</span>
+                简历 RAG 智能问答
+            </div>
             <div class="masthead-meta">
                 <div class="status-pill" :class="health.es_connected ? 'ok' : 'bad'">
-                    ES · {{ health.es_connected ? 'online' : 'offline' }}
+                    ES · {{ health.es_connected ? '在线' : '离线' }}
                 </div>
-                <div style="margin-top:6px;">
-                    <div class="status-pill" :class="health.embedding_loaded ? 'ok' : 'warn'">
-                        Embedding · {{ health.embedding_loaded ? 'ready' : 'loading' }}
-                    </div>
+                <div class="status-pill" :class="health.embedding_loaded ? 'ok' : 'warn'">
+                    Embedding · {{ health.embedding_loaded ? '就绪' : '加载中' }}
                 </div>
             </div>
         </header>
@@ -101,22 +102,20 @@ const app = createApp({
             {{ notification.msg }}
         </div>
 
-        <!-- Config - 编辑式配置条 -->
         <api-key-config :api-config="apiConfig" :remember-key="rememberKey"
             :model-datalist="modelDatalist" :llm-presets="llmPresets"
             :default-api-key-configured="defaultApiKeyConfigured"
             @update:remember-key="rememberKey = $event" />
 
-        <!-- Tabs -->
         <nav class="tabs">
             <button class="tab-btn" :class="{ active: activeTab === 'chat' }" @click="activeTab = 'chat'">
-                问答<span class="tab-num">01</span>
+                💬 问答
             </button>
             <button class="tab-btn" :class="{ active: activeTab === 'knowledge' }" @click="activeTab = 'knowledge'">
-                知识库<span class="tab-num">02</span>
+                📚 知识库
             </button>
             <button class="tab-btn" :class="{ active: activeTab === 'stats' }" @click="activeTab = 'stats'">
-                统计<span class="tab-num">03</span>
+                📊 统计
             </button>
         </nav>
 
@@ -201,9 +200,12 @@ app.component('chat-panel', {
     <div>
         <!-- 会话工具栏 -->
         <div class="chat-bar">
-            <span class="chat-bar-label">对话</span>
+            <span class="chat-bar-label">💬 对话</span>
             <button class="btn-new-chat" @click="newSession">＋ 新建</button>
-            <div v-for="s in sessions" :key="s.id"
+            <div class="btn-search-bar">
+                🔍 <input v-model="sessionSearch" placeholder="搜索对话…" />
+            </div>
+            <div v-for="s in filteredSessions" :key="s.id"
                  :class="['session-chip', { active: s.id === currentSessionId }]"
                  @click="loadSession(s.id)">
                 <span class="session-title">{{ s.title }}</span>
@@ -355,8 +357,19 @@ app.component('chat-panel', {
             lastQuestion: '',
             followUpQuestions: [],
             documents: [],
-            suggestedQuestions: []
+            suggestedQuestions: [],
+            sessionSearch: ''
         };
+    },
+    computed: {
+        filteredSessions() {
+            const q = this.sessionSearch.trim().toLowerCase();
+            if (!q) return this.sessions;
+            return this.sessions.filter(s =>
+                (s.title || '').toLowerCase().includes(q) ||
+                (s.messages || []).some(m => (m.content || '').toLowerCase().includes(q))
+            );
+        }
     },
     mounted() {
         if (this.messages.length > 0) {
@@ -682,7 +695,7 @@ app.component('knowledge-panel', {
             <div class="upload-zone" :class="{ over: isDragOver }"
                 @dragover.prevent="isDragOver = true" @dragleave="isDragOver = false"
                 @drop.prevent="handleDrop" @click="$refs.fi.click()">
-                <div class="upload-icon">⤴</div>
+                <div class="upload-icon">⬆</div>
                 <p>点击或拖拽 PDF / TXT / CSV / Markdown</p>
                 <p class="upload-limit">最大 10MB · 支持多文件</p>
                 <input type="file" ref="fi" accept=".pdf,.txt,.csv,.md,.markdown" multiple @change="handleFileSelect" hidden />
@@ -694,16 +707,24 @@ app.component('knowledge-panel', {
         </div>
 
         <div class="knowledge-card">
-            <h3 class="section-title">文档列表 <span style="color:var(--ink-mute); font-weight:400;">· {{ documents.length }}</span></h3>
+            <h3 class="section-title">
+                文档列表
+                <span class="section-title-count">· {{ filteredDocs.length }} / {{ documents.length }}</span>
+            </h3>
+            <div class="btn-search-bar" style="margin-bottom:14px;">
+                🔍 <input v-model="docSearch" placeholder="搜索文档名…" />
+            </div>
             <div v-if="loading" class="loading">
                 <div class="spinner"></div>
                 加载中
             </div>
-            <div v-else-if="documents.length === 0" class="empty-state" style="padding:20px 0;">暂无文档</div>
+            <div v-else-if="filteredDocs.length === 0" class="empty-state" style="padding:24px 0;">
+                {{ docSearch ? '没有匹配的文档' : '暂无文档，先上传第一份吧' }}
+            </div>
             <table v-else class="doc-table">
                 <thead><tr><th>文件名</th><th>类型</th><th>分块</th><th>时间</th><th>操作</th></tr></thead>
                 <tbody>
-                    <tr v-for="d in documents" :key="d.file_name">
+                    <tr v-for="d in filteredDocs" :key="d.file_name">
                         <td>{{ d.file_name }}</td>
                         <td><span class="doc-type">{{ d.file_type }}</span></td>
                         <td>{{ d.chunk_count }}</td>
@@ -715,7 +736,20 @@ app.component('knowledge-panel', {
         </div>
     </div>
     `,
-    data() { return { documents: [], loading: false, uploading: false, uploadProgress: 0, uploadStatusText: '准备中', isDragOver: false }; },
+    data() {
+        return {
+            documents: [], loading: false, uploading: false,
+            uploadProgress: 0, uploadStatusText: '准备中',
+            isDragOver: false, docSearch: ''
+        };
+    },
+    computed: {
+        filteredDocs() {
+            const q = (this.docSearch || '').trim().toLowerCase();
+            if (!q) return this.documents;
+            return this.documents.filter(d => (d.file_name || '').toLowerCase().includes(q));
+        }
+    },
     mounted() { this.load(); },
     methods: {
         async load() {
