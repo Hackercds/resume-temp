@@ -5,7 +5,7 @@
 """
 import uuid
 import time
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Dict
 from pydantic import BaseModel, Field
 
 
@@ -66,6 +66,9 @@ class SourceItem(BaseModel):
     content: str
     file_name: str
     score: float = 0.0
+    section_title: str = ""
+    chunk_index: int = 0
+    is_full_doc: bool = False
 
 
 class TimingInfo(BaseModel):
@@ -74,11 +77,30 @@ class TimingInfo(BaseModel):
     llm_s: float = 0.0
 
 
+class QueryTrace(BaseModel):
+    """检索过程追踪，用于调试与前端展示"""
+    trace_id: str = ""
+    intent: Optional[str] = None
+    original_question: str = ""
+    expanded_question: str = ""
+    context_question: str = ""
+    rewrite_method: str = "none"
+    candidates_before_boost: int = 0
+    candidates_after_boost: int = 0
+    source_boosts: Dict[str, float] = Field(default_factory=dict)
+    full_doc_requested: bool = False
+    error: Optional[str] = None
+
+
 class QueryResult(BaseModel):
     answer: str
     sources: List[SourceItem] = []
     trace_id: str = ""
     timing: Optional[TimingInfo] = None
+    trace: Optional[QueryTrace] = None
+    suggestion: Optional[str] = None
+    empty_retrieval: bool = False
+    fallback_context: Optional[str] = None
 
 
 # ---------- 文档管理 ----------
@@ -113,3 +135,4 @@ class HealthResult(BaseModel):
     version: str = "1.0.0"
     embedding_loaded: bool = False
     es_connected: bool = False
+    default_api_key_configured: bool = False

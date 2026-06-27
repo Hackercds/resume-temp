@@ -21,7 +21,7 @@ from typing import Optional
 
 from internal.model.dto import (
     APIResponse, QueryRequest, QueryResult, SourceItem, TimingInfo,
-    UploadResult, DeleteResult, StatsResult, HealthResult, DocumentInfo
+    QueryTrace, UploadResult, DeleteResult, StatsResult, HealthResult, DocumentInfo
 )
 from internal.model.config import get_config
 from internal.pkg.logger import get_logger
@@ -113,17 +113,39 @@ async def health_check():
         logger.warn(rid, "health", "Embedding 健康检查异常", error=str(e)[:100])
 
     status = "ok" if es_connected else "degraded"
+    cfg = get_config()
 
     result = HealthResult(
         status=status,
         embedding_loaded=embedding_loaded,
-        es_connected=es_connected
+        es_connected=es_connected,
+        default_api_key_configured=bool(cfg.app.default_api_key),
     )
 
     return APIResponse.success(
         data=result.model_dump(),
         request_id=rid
     )
+
+
+# ---------- 公开配置（模型预设、默认 API Key 状态）----------
+@router.get("/api/config")
+async def get_public_config():
+    """
+    返回前端所需的公开配置：
+    - LLM 预设模型列表
+    - 是否已配置默认 API Key（隐藏真实 Key）
+    """
+    rid = str(uuid.uuid4())[:8]
+    cfg = get_config()
+    return APIResponse.success(
+        data={
+            "llm_presets": cfg.llm.presets,
+            "default_api_key_configured": bool(cfg.app.default_api_key),
+            "chunk_strategy": cfg.chunk.strategy,
+        },
+        request_id=rid
+    ).model_dump()
 
 
 # ---------- POST /api/query ----------
@@ -162,11 +184,19 @@ async def rag_query(request: Request, body: QueryRequest):
         if result.get("timing"):
             timing = TimingInfo(**result["timing"])
 
+        trace = None
+        if result.get("trace"):
+            trace = QueryTrace(**result["trace"])
+
         query_result = QueryResult(
             answer=result["answer"],
             sources=sources,
             trace_id=result.get("trace_id", rid),
-            timing=timing
+            timing=timing,
+            trace=trace,
+            suggestion=result.get("suggestion"),
+            empty_retrieval=result.get("empty_retrieval", False),
+            fallback_context=result.get("fallback_context"),
         )
 
         logger.info(rid, "api_handler", "查询返回成功",

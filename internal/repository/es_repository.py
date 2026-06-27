@@ -75,6 +75,7 @@ class ESRepository:
                     "file_name": {"type": "keyword"},
                     "chunk_index": {"type": "integer"},
                     "char_count": {"type": "integer"},
+                    "section_title": {"type": "keyword"},
                     "upload_time": {"type": "date"},
                     "full_text": {"type": "text", "analyzer": "standard"},
                     "is_full_doc": {"type": "boolean"},
@@ -97,7 +98,7 @@ class ESRepository:
 
     def _ensure_full_doc_fields(self):
         """
-        兼容旧索引：动态添加整篇文档召回所需字段。
+        兼容旧索引：动态添加整篇文档召回及语义分块所需字段。
         ES 8.x 支持向已有 mapping 添加字段，不会丢失数据。
         """
         es = self.connect()
@@ -107,7 +108,8 @@ class ESRepository:
             missing = []
             for field, ftype in [("full_text", {"type": "text", "analyzer": "standard"}),
                                  ("is_full_doc", {"type": "boolean"}),
-                                 ("doc_id", {"type": "keyword"})]:
+                                 ("doc_id", {"type": "keyword"}),
+                                 ("section_title", {"type": "keyword"})]:
                 if field not in props:
                     missing.append((field, ftype))
             if missing:
@@ -161,6 +163,7 @@ class ESRepository:
                 "file_name": chunk["file_name"],
                 "chunk_index": chunk.get("chunk_index", 0),
                 "char_count": chunk.get("char_count", len(chunk["content"])),
+                "section_title": chunk.get("section_title", ""),
                 "upload_time": chunk.get("upload_time", now),
                 "vector": vector.tolist()
             }
@@ -230,7 +233,7 @@ class ESRepository:
                     }
                 }
             },
-            "_source": ["chunk_id", "content", "file_name", "chunk_index"]
+            "_source": ["chunk_id", "content", "file_name", "chunk_index", "section_title"]
         }
         response = es.search(index=self.index, body=body)
         return [
@@ -239,6 +242,7 @@ class ESRepository:
                 "content": hit["_source"]["content"],
                 "file_name": hit["_source"]["file_name"],
                 "chunk_index": hit["_source"].get("chunk_index", 0),
+                "section_title": hit["_source"].get("section_title", ""),
                 "score": hit["_score"] - 1.0  # 还原为真实余弦相似度
             }
             for hit in response["hits"]["hits"]
@@ -260,7 +264,7 @@ class ESRepository:
                     }
                 }
             },
-            "_source": ["chunk_id", "content", "file_name", "chunk_index"]
+            "_source": ["chunk_id", "content", "file_name", "chunk_index", "section_title"]
         }
         response = es.search(index=self.index, body=body)
         return [
@@ -269,6 +273,7 @@ class ESRepository:
                 "content": hit["_source"]["content"],
                 "file_name": hit["_source"]["file_name"],
                 "chunk_index": hit["_source"].get("chunk_index", 0),
+                "section_title": hit["_source"].get("section_title", ""),
                 "score": hit["_score"]
             }
             for hit in response["hits"]["hits"]

@@ -21,6 +21,7 @@ from internal.service.embedding_service import EmbeddingService
 from internal.service.es_service import ESService
 from internal.service.llm_service import LLMService
 from internal.service.rerank_service import RerankService
+from internal.service.intent_service import IntentService
 
 
 class RAGService:
@@ -28,17 +29,6 @@ class RAGService:
 
     # LLM 请求查看完整文档的标记
     _RETRIEVE_MARK = re.compile(r"\{\{retrieve_full_doc:([^}]+)\}\}")
-
-    # 意图识别关键词（规则版，零成本）
-    _FOLLOW_UP_KEYWORDS = {
-        '他', '她', '它', '这', '那', '这个', '那个', '这篇', '这份', '这个文件',
-        '上文', '前面', '刚才', '接着', '还有', '另外', '除此之外', '那么',
-        '为什么', '怎么', '多少', '多久', '哪些', '什么样'
-    }
-    _SUMMARIZE_KEYWORDS = {
-        '总结', '概括', '归纳', '对比', '比较', '区别', '不同', '相同', '优劣',
-        '整体', '全文', '主要', '主旨', '核心'
-    }
 
     def __init__(self,
                  embedding_service: EmbeddingService = None,
@@ -49,45 +39,41 @@ class RAGService:
         self.es = es_service or ESService()
         self.llm = llm_service or LLMService()
         self.rerank = rerank_service  # 可选
+        self.intent = IntentService(llm_service=self.llm)
         self.logger = get_logger()
 
     def _classify_intent(self, question: str, history: List[Dict]) -> str:
-        """简单意图识别：new_topic / follow_up / summarize / clarify"""
-        if not history:
-            return "new_topic"
-        q = question.lower()
+        """调用 IntentService 进行意图识别"""
+        intent, _ = self.intent.classify(question, history)
+        return intent
 
-        # 总结/对比意图
-        if any(k in q for k in self._SUMMARIZE_KEYWORDS):
-            return "summarize"
-
-        # 强指代词 → 追问
-        strong_follow_up = {'他', '她', '它', '这个', '那个', '这篇', '这份', '这个文件'}
-        if any(k in q for k in strong_follow_up):
-            return "follow_up"
-
-        # 问题较长（>=15字）且不含强指代 → 大概率新话题
-        if len(question.strip()) >= 15:
-            return "new_topic"
-
-        # 弱指代词或短问题 → 追问
-        weak_follow_up = {'这', '那', '上文', '前面', '刚才', '接着', '还有', '另外', '除此之外', '那么'}
-        if any(k in q for k in weak_follow_up):
-            return "follow_up"
-
-        # 疑问词开头的短问题也认为是追问
-        if len(question.strip()) < 10:
-            return "follow_up"
-
-        return "new_topic"
-
-    def _rewrite_query(self, question: str, intent: str, history: List[Dict]) -> str:
-        """根据意图重写检索查询"""
+    def _rewrite_query(self, question: str, intent: str, history: List[Dict]) -> Dict:
+        """
+        根据意图重写检索查询。
+        返回 dict：{
+            "original": question,
+            "expanded": 指代消解后的独立问句,
+            "context": 带上下文的查询,
+            "intent": intent
+        }
+        """
         cfg = get_config().conversation
-        if not cfg.enable_query_rewrite or intent == "new_topic" or not history:
-            return question
+        result = {
+            "original": question,
+            "expanded": question,
+            "context": question,
+            "intent": intent,
+        }
 
-        # 取最近 2 条消息（通常是一问一答）作为上下文
+        if not cfg.enable_query_rewrite or intent == "new_topic" or not history:
+            return result
+
+        # 提取最近 assistant 答案中的实体，做指代消解
+        entities = IntentService.extract_entities(question, history)
+        expanded = IntentService.resolve_references(question, entities)
+        result["expanded"] = expanded
+
+        # 取最近 2 条消息作为上下文
         recent = history[-2:] if len(history) >= 2 else history
         context_text = "\n".join(
             f"{'用户' if m.get('role') == 'user' else '助手'}: {m.get('content', '')[:240]}"
@@ -95,41 +81,71 @@ class RAGService:
         )
 
         if intent == "follow_up":
-            # 提取前一轮 user 问题的核心实体，补充到追问中
             prev_user = next((m for m in reversed(recent) if m.get('role') == 'user'), None)
             prev_topic = prev_user.get('content', '') if prev_user else ''
-            return f"关于「{prev_topic}」的追问：{question}\n\n前文摘要：{context_text[:200]}"
-        if intent == "summarize":
-            return f"请基于以下内容总结或对比：\n{context_text}\n\n用户要求：{question}"
-        if intent == "clarify":
-            return f"{question}（上下文：{context_text[:300]}）"
-        return question
+            result["context"] = (
+                f"基于之前关于「{prev_topic}」的讨论，当前追问：{expanded}\n\n"
+                f"前文摘要：{context_text[:200]}"
+            )
+        elif intent == "summarize":
+            result["context"] = f"请基于以下内容总结或对比：\n{context_text}\n\n用户要求：{question}"
+        elif intent == "clarify":
+            result["context"] = f"{question}（上下文：{context_text[:300]}）"
 
-    def _extract_historical_files(self, history: List[Dict]) -> Set[str]:
-        """从历史 assistant 消息中提取用过的 file_name"""
-        historical_files = set()
+        return result
+
+    def _build_historical_file_weights(self, history: List[Dict]) -> Dict[str, float]:
+        """
+        从历史 assistant 消息中构建 file_name → weight 映射。
+        权重 = 引用次数 + 时间衰减（越近越高）。
+        """
+        file_stats: Dict[str, Dict] = {}
         if not history:
-            return historical_files
-        for m in history:
-            if m.get("role") == "assistant" and m.get("sources"):
-                for s in m["sources"]:
-                    if s.get("file_name"):
-                        historical_files.add(s["file_name"])
-        return historical_files
+            return file_stats
+
+        assistant_msgs = [m for m in history if m.get("role") == "assistant"]
+        total = len(assistant_msgs)
+
+        for idx, m in enumerate(assistant_msgs):
+            sources = m.get("sources") or []
+            rounds_ago = total - idx  # 1 = 最近一轮
+            for s in sources:
+                fn = s.get("file_name")
+                if not fn:
+                    continue
+                stat = file_stats.setdefault(fn, {"count": 0, "recency": rounds_ago})
+                stat["count"] += 1
+                stat["recency"] = min(stat["recency"], rounds_ago)
+
+        return file_stats
 
     def _boost_historical_sources(self, candidates: List[Dict],
                                   history: List[Dict],
                                   boost: float = 0.15) -> List[Dict]:
-        """对历史来源文档的 chunks 进行加权"""
+        """
+        对历史来源文档的 chunks 进行加权。
+        加权 = source_boost * (1 + log(引用次数)) * exp(-轮数/衰减窗口)
+        """
         if not history or boost <= 0:
             return candidates
-        historical_files = self._extract_historical_files(history)
-        if not historical_files:
+
+        cfg = get_config().conversation
+        decay_window = max(1, cfg.source_boost_decay)
+        file_weights = self._build_historical_file_weights(history)
+        if not file_weights:
             return candidates
 
+        import math
         for c in candidates:
-            if c.get("file_name") in historical_files:
-                c["score"] = c.get("score", 0) + boost
+            fn = c.get("file_name")
+            if fn in file_weights:
+                stat = file_weights[fn]
+                count_factor = 1 + math.log1p(stat["count"])
+                time_factor = math.exp(-stat["recency"] / decay_window)
+                actual_boost = boost * count_factor * time_factor
+                c["score"] = c.get("score", 0) + actual_boost
+                c["source_boost"] = round(actual_boost, 4)
+
         # 重新按分数排序
         candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
         return candidates
@@ -164,178 +180,218 @@ class RAGService:
               retrieve_full_doc: bool = False) -> Dict:
         """
         RAG 查询主流程 - 面试点：全链路耗时分布
-        1. embedding 推理: ~50-200ms (CPU)
-        2. ES 混合检索: ~20-50ms
-        3. 可选重排: ~50ms/candidate
-        4. LLM 生成: ~1-3s
-
-        返回结构：
-        {answer, sources, trace_id, timing}
         """
         trace_id = str(uuid.uuid4())[:8]
         timing = {}
         cfg = get_config().conversation
+        trace = {
+            "trace_id": trace_id,
+            "intent": None,
+            "original_question": question,
+            "expanded_question": question,
+            "context_question": question,
+            "rewrite_method": "none",
+            "candidates_before_boost": 0,
+            "candidates_after_boost": 0,
+            "source_boosts": {},
+            "full_doc_requested": False,
+            "error": None,
+        }
 
-        # 意图识别 + 查询重写
-        intent = self._classify_intent(question, history)
-        rewritten_question = self._rewrite_query(question, intent, history)
-        # 压缩历史，避免淹没上下文
-        compressed_history = self._compress_history(history, threshold=cfg.summary_threshold)
-
-        self.logger.info(trace_id, "rag_service",
-                         "意图识别完成",
-                         intent=intent,
-                         original=question[:80],
-                         rewritten=rewritten_question[:120])
-
-        # Step 1: 查询向量化（使用重写后的问题）
-        embed_start = time.time()
         try:
-            query_vector = self.embedding.encode_query(rewritten_question)
-        except ModelLoadError:
-            # 降级到纯 BM25
-            self.logger.warn(trace_id, "rag_service",
-                             "Embedding加载失败，降级到 BM25 检索")
-            return self._query_bm25_fallback(question, api_key, provider, model,
-                                             top_k, trace_id, history=history,
-                                             retrieve_full_doc=retrieve_full_doc)
-        embed_time = (time.time() - embed_start) * 1000
-        timing["embedding_ms"] = round(embed_time, 1)
-        self.logger.info(trace_id, "rag_service",
-                         "Step1 Embedding 完成",
-                         duration_ms=round(embed_time, 1))
+            # 意图识别 + 查询重写
+            intent = self._classify_intent(question, history)
+            rewritten = self._rewrite_query(question, intent, history)
+            trace["intent"] = intent
+            trace["expanded_question"] = rewritten.get("expanded", question)
+            trace["context_question"] = rewritten.get("context", question)
+            trace["rewrite_method"] = "intent+entity" if rewritten.get("expanded") != question else "none"
 
-        # Step 2: ES 混合检索（使用重写后的问题）
-        search_start = time.time()
-        try:
-            candidates = self.es.search_hybrid(
-                query_vector, query_text=rewritten_question,
-                top_k=top_k * 2,  # 检索 2 倍给重排留空间
-                min_score=get_config().retrieval.min_score
+            # 同时用 expanded 和 context 做向量检索，然后融合
+            rewritten_question = rewritten.get("context", question)
+            expanded_question = rewritten.get("expanded", question)
+            compressed_history = self._compress_history(history, threshold=cfg.summary_threshold)
+
+            self.logger.info(trace_id, "rag_service",
+                             "意图识别完成",
+                             intent=intent,
+                             original=question[:80],
+                             expanded=expanded_question[:120],
+                             context=rewritten_question[:120])
+
+            # Step 1: 查询向量化（使用重写后的问题）
+            embed_start = time.time()
+            try:
+                query_vector = self.embedding.encode_query(rewritten_question)
+            except ModelLoadError:
+                self.logger.warn(trace_id, "rag_service",
+                                 "Embedding加载失败，降级到 BM25 检索")
+                return self._query_bm25_fallback(question, api_key, provider, model,
+                                                 top_k, trace_id, history=history,
+                                                 retrieve_full_doc=retrieve_full_doc)
+            embed_time = (time.time() - embed_start) * 1000
+            timing["embedding_ms"] = round(embed_time, 1)
+
+            # Step 2: ES 混合检索（主查询：context 版本）
+            search_start = time.time()
+            try:
+                candidates = self.es.search_hybrid(
+                    query_vector, query_text=rewritten_question,
+                    top_k=top_k * 2,
+                    min_score=get_config().retrieval.min_score
+                )
+
+                # 若 expanded 与 context 不同，再做一次检索并融合
+                if expanded_question != rewritten_question:
+                    vec2 = self.embedding.encode_query(expanded_question)
+                    expanded_candidates = self.es.search_hybrid(
+                        vec2, query_text=expanded_question,
+                        top_k=top_k * 2,
+                        min_score=get_config().retrieval.min_score
+                    )
+                    candidates = self._merge_candidates(candidates, expanded_candidates)
+
+            except ESConnectionError as e:
+                self.logger.error(trace_id, "rag_service", "ES 连接失败", error=str(e))
+                trace["error"] = "search_unavailable"
+                return self._build_error_response(
+                    trace_id, timing, trace,
+                    "检索服务暂时不可用，请稍后重试。",
+                    suggestion="请检查 Elasticsearch 连接（ES_HOST 环境变量或 config.yaml）是否正确。"
+                )
+            search_time = (time.time() - search_start) * 1000
+            timing["search_ms"] = round(search_time, 1)
+
+            # Step 3: 可选重排
+            if self.rerank and len(candidates) > top_k:
+                candidates = self.rerank.rerank(expanded_question, candidates, top_k=top_k)
+            else:
+                candidates = candidates[:top_k]
+
+            # Step 4: 空检索 / 低质量结果 → 尝试多实体分解检索
+            if not candidates or len(candidates) < 3:
+                entities = self._extract_entities(expanded_question)
+                if len(entities) >= 2:
+                    self.logger.info(trace_id, "rag_service",
+                                     "向量检索结果不足，启用多实体分解检索",
+                                     entities=entities, original_count=len(candidates))
+                    decomposed = self._multi_entity_retrieve(expanded_question, entities, top_k)
+                    if decomposed:
+                        seen = {c["chunk_id"] for c in candidates}
+                        for c in decomposed:
+                            if c["chunk_id"] not in seen:
+                                candidates.append(c)
+                                seen.add(c["chunk_id"])
+                        timing["decomposed"] = True
+                        timing["decomposed_count"] = len(decomposed)
+
+            # Step 5: 检索仍为空时的兜底 + 引导
+            if not candidates:
+                trace["error"] = "empty_retrieval"
+                return self._build_error_response(
+                    trace_id, timing, trace,
+                    "抱歉，知识库中未找到与您问题相关的信息。",
+                    suggestion="建议：1) 尝试用不同关键词提问；2) 上传包含相关内容的文档；3) 如果是人名/项目关系查询，可分别搜索每个实体。",
+                    empty_retrieval=True
+                )
+
+            # Step 6: 用户手动触发整篇文档召回
+            if retrieve_full_doc and get_config().retrieval.enable_full_document:
+                full_docs = self._retrieve_full_documents(
+                    list({c["file_name"] for c in candidates})
+                )
+                if full_docs:
+                    candidates = full_docs
+
+            # Step 7: 来源复用加权（放在重排后，避免干扰重排）
+            trace["candidates_before_boost"] = len(candidates)
+            candidates = self._boost_historical_sources(
+                candidates, history, boost=cfg.source_boost
             )
-        except ESConnectionError as e:
-            self.logger.error(trace_id, "rag_service", "ES 连接失败", error=str(e))
-            return {
-                "answer": "检索服务暂时不可用，请稍后重试。",
-                "sources": [],
-                "trace_id": trace_id,
-                "timing": timing,
-                "error": "search_unavailable"
+            trace["candidates_after_boost"] = len(candidates)
+            trace["source_boosts"] = {
+                c.get("file_name"): c.get("source_boost", 0)
+                for c in candidates if c.get("source_boost")
             }
-        search_time = (time.time() - search_start) * 1000
-        timing["search_ms"] = round(search_time, 1)
-        self.logger.info(trace_id, "rag_service",
-                         "Step2 ES混合检索完成",
-                         duration_ms=round(search_time, 1),
-                         candidates=len(candidates))
 
-        # Step 3: 可选重排
-        if self.rerank and len(candidates) > top_k:
-            candidates = self.rerank.rerank(question, candidates, top_k=top_k)
-        else:
+            # summarize 意图扩大最终返回数量
+            if intent == "summarize":
+                top_k = max(top_k, 10)
+
             candidates = candidates[:top_k]
 
-        # Step 4: 空检索 / 低质量结果 → 尝试多实体分解检索
-        if not candidates or len(candidates) < 3:
-            entities = self._extract_entities(rewritten_question)
-            if len(entities) >= 2:
+            # Step 8: 拼接上下文
+            context = self._build_context(candidates)
+
+            # Step 9: 调用 LLM 生成
+            llm_start = time.time()
+            try:
+                answer = self.llm.generate(
+                    question=question,
+                    context=context,
+                    api_key=api_key,
+                    provider=provider,
+                    model=model,
+                    base_url=base_url,
+                    history=compressed_history,
+                    allow_full_doc_retrieval=(not retrieve_full_doc)
+                )
+            except LLMAPIError as e:
+                self.logger.error(trace_id, "rag_service", "LLM调用失败", error=str(e))
+                trace["error"] = "llm_error"
+                return self._build_error_response(
+                    trace_id, timing, trace,
+                    f"AI 生成服务暂时不可用：{str(e)}",
+                    suggestion="请检查 API Key 是否有效、模型名称是否正确，或稍后重试。",
+                    fallback_context=context
+                )
+            llm_time = time.time() - llm_start
+            timing["llm_s"] = round(llm_time, 1)
+
+            # Step 10: 检测 LLM 是否请求查看完整文档
+            requested_file = self._need_full_document(answer)
+            if requested_file and not retrieve_full_doc and get_config().retrieval.enable_full_document:
                 self.logger.info(trace_id, "rag_service",
-                                 "向量检索结果不足，启用多实体分解检索",
-                                 entities=entities, original_count=len(candidates))
-                decomposed = self._multi_entity_retrieve(rewritten_question, entities, top_k)
-                if decomposed:
-                    seen = {c["chunk_id"] for c in candidates}
-                    for c in decomposed:
-                        if c["chunk_id"] not in seen:
-                            candidates.append(c)
-                            seen.add(c["chunk_id"])
-                    timing["decomposed"] = True
-                    timing["decomposed_count"] = len(decomposed)
+                                 "LLM 请求召回整篇文档", file_name=requested_file)
+                full_docs = self._retrieve_full_documents([requested_file])
+                if full_docs:
+                    full_context = self._build_context(full_docs)
+                    try:
+                        answer = self.llm.generate(
+                            question=question,
+                            context=full_context,
+                            api_key=api_key,
+                            provider=provider,
+                            model=model,
+                            base_url=base_url,
+                            history=compressed_history,
+                            allow_full_doc_retrieval=False
+                        )
+                        candidates = full_docs
+                        timing["full_doc_retrieval"] = True
+                        trace["full_doc_requested"] = True
+                    except LLMAPIError as e:
+                        self.logger.error(trace_id, "rag_service",
+                                          "整篇文档重新生成失败", error=str(e))
 
-        # Step 5: 检索仍为空时的兜底
-        if not candidates:
-            return {
-                "answer": "抱歉，知识库中未找到与您问题相关的信息。\n\n"
-                          "建议：\n"
-                          "1. 尝试用不同的关键词提问\n"
-                          "2. 检查知识库中是否已上传相关文档\n"
-                          "3. 如果是多个人名的关系查询，可分别搜索每个人的信息",
-                "sources": [],
-                "trace_id": trace_id,
-                "timing": timing
-            }
-
-        # Step 6: 用户手动触发整篇文档召回
-        if retrieve_full_doc and get_config().retrieval.enable_full_document:
-            full_docs = self._retrieve_full_documents(
-                list({c["file_name"] for c in candidates})
+            # 构造返回
+            return self._build_success_response(
+                question, answer, candidates, trace_id, timing, trace
             )
-            if full_docs:
-                candidates = full_docs
 
-        # Step 7: 来源复用加权（放在重排后，避免干扰重排）
-        candidates = self._boost_historical_sources(
-            candidates, history, boost=cfg.source_boost
-        )
-
-        # summarize 意图扩大最终返回数量
-        if intent == "summarize":
-            top_k = max(top_k, 10)
-
-        candidates = candidates[:top_k]
-
-        # Step 8: 拼接上下文
-        context = self._build_context(candidates)
-
-        # Step 9: 调用 LLM 生成
-        llm_start = time.time()
-        try:
-            answer = self.llm.generate(
-                question=question,
-                context=context,
-                api_key=api_key,
-                provider=provider,
-                model=model,
-                base_url=base_url,
-                history=compressed_history,
-                allow_full_doc_retrieval=(not retrieve_full_doc)
+        except Exception as e:
+            self.logger.error(trace_id, "rag_service", "查询未捕获异常", error=str(e))
+            trace["error"] = "internal_error"
+            return self._build_error_response(
+                trace_id, timing, trace,
+                f"系统异常：{str(e)}",
+                suggestion="请稍后重试，或查看后端日志排查问题。"
             )
-        except LLMAPIError as e:
-            # LLM 失败时返回检索到的原始内容
-            self.logger.error(trace_id, "rag_service", "LLM调用失败", error=str(e))
-            answer = f"AI 生成服务暂时不可用。以下是知识库中相关的内容（降级模式）：\n\n{context}"
-        llm_time = time.time() - llm_start
-        timing["llm_s"] = round(llm_time, 1)
-        self.logger.info(trace_id, "rag_service",
-                         "Step9 LLM 生成完成",
-                         duration_s=round(llm_time, 1))
 
-        # Step 10: 检测 LLM 是否请求查看完整文档
-        requested_file = self._need_full_document(answer)
-        if requested_file and not retrieve_full_doc and get_config().retrieval.enable_full_document:
-            self.logger.info(trace_id, "rag_service",
-                             "LLM 请求召回整篇文档", file_name=requested_file)
-            full_docs = self._retrieve_full_documents([requested_file])
-            if full_docs:
-                full_context = self._build_context(full_docs)
-                try:
-                    answer = self.llm.generate(
-                        question=question,
-                        context=full_context,
-                        api_key=api_key,
-                        provider=provider,
-                        model=model,
-                        base_url=base_url,
-                        history=compressed_history,
-                        allow_full_doc_retrieval=False  # 避免无限循环
-                    )
-                    candidates = full_docs
-                    timing["full_doc_retrieval"] = True
-                except LLMAPIError as e:
-                    self.logger.error(trace_id, "rag_service",
-                                      "整篇文档重新生成失败", error=str(e))
-
-        # 构造返回
+    def _build_success_response(self, question: str, answer: str,
+                                candidates: List[Dict], trace_id: str,
+                                timing: Dict, trace: Dict) -> Dict:
+        """构造成功响应"""
         total_time_ms = sum(v for k, v in timing.items() if isinstance(v, (int, float)))
         self.logger.info(trace_id, "rag_service",
                          "RAG 查询完成",
@@ -348,13 +404,48 @@ class RAGService:
                 {
                     "content": c.get("content", ""),
                     "file_name": c.get("file_name", ""),
-                    "score": round(c.get("rerank_score", c.get("score", 0)), 3)
+                    "score": round(c.get("rerank_score", c.get("score", 0)), 3),
+                    "section_title": c.get("section_title", ""),
+                    "chunk_index": c.get("chunk_index", 0),
+                    "is_full_doc": c.get("is_full_doc", False),
                 }
                 for c in candidates
             ],
             "trace_id": trace_id,
-            "timing": timing
+            "timing": timing,
+            "trace": trace,
         }
+
+    def _build_error_response(self, trace_id: str, timing: Dict, trace: Dict,
+                              answer: str, suggestion: str = "",
+                              empty_retrieval: bool = False,
+                              fallback_context: str = "") -> Dict:
+        """构造带建议的错误/兜底响应"""
+        result = {
+            "answer": answer,
+            "sources": [],
+            "trace_id": trace_id,
+            "timing": timing,
+            "trace": trace,
+            "suggestion": suggestion,
+            "empty_retrieval": empty_retrieval,
+        }
+        if fallback_context:
+            result["fallback_context"] = fallback_context
+        return result
+
+    def _merge_candidates(self, c1: List[Dict], c2: List[Dict]) -> List[Dict]:
+        """合并两路候选结果，去重并按分数排序"""
+        seen = {}
+        for c in c1 + c2:
+            cid = c.get("chunk_id")
+            if not cid:
+                continue
+            if cid in seen:
+                seen[cid]["score"] = max(seen[cid].get("score", 0), c.get("score", 0))
+            else:
+                seen[cid] = dict(c)
+        return sorted(seen.values(), key=lambda x: x.get("score", 0), reverse=True)
 
     async def query_stream(self, question: str, api_key: str,
                            provider: str = "openai", model: str = None,
@@ -368,159 +459,216 @@ class RAGService:
         trace_id = str(uuid.uuid4())[:8]
         timing = {}
         cfg = get_config().conversation
+        trace = {
+            "trace_id": trace_id,
+            "intent": None,
+            "original_question": question,
+            "expanded_question": question,
+            "context_question": question,
+            "rewrite_method": "none",
+            "candidates_before_boost": 0,
+            "candidates_after_boost": 0,
+            "source_boosts": {},
+            "full_doc_requested": False,
+            "error": None,
+        }
 
-        # 意图识别 + 查询重写 + 历史压缩
-        intent = self._classify_intent(question, history)
-        rewritten_question = self._rewrite_query(question, intent, history)
-        compressed_history = self._compress_history(history, threshold=cfg.summary_threshold)
-
-        self.logger.info(trace_id, "rag_service",
-                         "流式查询意图识别完成",
-                         intent=intent,
-                         original=question[:80],
-                         rewritten=rewritten_question[:120])
-
-        # Step 1: 查询向量化（使用重写后的问题）
-        embed_start = time.time()
         try:
-            query_vector = self.embedding.encode_query(rewritten_question)
-        except ModelLoadError:
-            self.logger.warn(trace_id, "rag_service",
-                             "Embedding加载失败，流式查询终止")
-            yield {"type": "error", "message": "Embedding 加载失败，无法流式生成"}
-            return
-        embed_time = (time.time() - embed_start) * 1000
-        timing["embedding_ms"] = round(embed_time, 1)
+            # 意图识别 + 查询重写 + 历史压缩
+            intent = self._classify_intent(question, history)
+            rewritten = self._rewrite_query(question, intent, history)
+            trace["intent"] = intent
+            trace["expanded_question"] = rewritten.get("expanded", question)
+            trace["context_question"] = rewritten.get("context", question)
+            trace["rewrite_method"] = "intent+entity" if rewritten.get("expanded") != question else "none"
 
-        # Step 2: ES 混合检索（使用重写后的问题）
-        search_start = time.time()
-        try:
-            candidates = self.es.search_hybrid(
-                query_vector, query_text=rewritten_question,
-                top_k=top_k * 2,
-                min_score=get_config().retrieval.min_score
+            rewritten_question = rewritten.get("context", question)
+            expanded_question = rewritten.get("expanded", question)
+            compressed_history = self._compress_history(history, threshold=cfg.summary_threshold)
+
+            self.logger.info(trace_id, "rag_service",
+                             "流式查询意图识别完成",
+                             intent=intent,
+                             original=question[:80],
+                             expanded=expanded_question[:120],
+                             context=rewritten_question[:120])
+
+            # Step 1: 查询向量化（使用重写后的问题）
+            embed_start = time.time()
+            try:
+                query_vector = self.embedding.encode_query(rewritten_question)
+            except ModelLoadError:
+                self.logger.warn(trace_id, "rag_service",
+                                 "Embedding加载失败，流式查询终止")
+                yield {"type": "error", "message": "Embedding 加载失败，无法流式生成", "trace_id": trace_id}
+                return
+            embed_time = (time.time() - embed_start) * 1000
+            timing["embedding_ms"] = round(embed_time, 1)
+
+            # Step 2: ES 混合检索（主查询：context 版本）
+            search_start = time.time()
+            try:
+                candidates = self.es.search_hybrid(
+                    query_vector, query_text=rewritten_question,
+                    top_k=top_k * 2,
+                    min_score=get_config().retrieval.min_score
+                )
+
+                # 若 expanded 与 context 不同，再做一次检索并融合
+                if expanded_question != rewritten_question:
+                    vec2 = self.embedding.encode_query(expanded_question)
+                    expanded_candidates = self.es.search_hybrid(
+                        vec2, query_text=expanded_question,
+                        top_k=top_k * 2,
+                        min_score=get_config().retrieval.min_score
+                    )
+                    candidates = self._merge_candidates(candidates, expanded_candidates)
+            except ESConnectionError as e:
+                self.logger.error(trace_id, "rag_service", "ES 连接失败", error=str(e))
+                trace["error"] = "search_unavailable"
+                yield {"type": "error", "message": "检索服务暂时不可用，请稍后重试", "suggestion": "请检查 Elasticsearch 连接（ES_HOST）是否正确。", "trace_id": trace_id}
+                return
+            search_time = (time.time() - search_start) * 1000
+            timing["search_ms"] = round(search_time, 1)
+
+            # Step 3: 可选重排
+            if self.rerank and len(candidates) > top_k:
+                candidates = self.rerank.rerank(expanded_question, candidates, top_k=top_k)
+            else:
+                candidates = candidates[:top_k]
+
+            # Step 4: 多实体分解检索
+            if not candidates or len(candidates) < 3:
+                entities = self._extract_entities(expanded_question)
+                if len(entities) >= 2:
+                    decomposed = self._multi_entity_retrieve(expanded_question, entities, top_k)
+                    if decomposed:
+                        seen = {c["chunk_id"] for c in candidates}
+                        for c in decomposed:
+                            if c["chunk_id"] not in seen:
+                                candidates.append(c)
+                                seen.add(c["chunk_id"])
+                        timing["decomposed"] = True
+                        timing["decomposed_count"] = len(decomposed)
+
+            # Step 5: 空检索兜底 + 引导
+            if not candidates:
+                trace["error"] = "empty_retrieval"
+                yield {
+                    "type": "error",
+                    "message": "知识库中未找到与您问题相关的信息",
+                    "suggestion": "建议：1) 尝试用不同关键词提问；2) 上传包含相关内容的文档；3) 如果是人名/项目关系查询，可分别搜索每个实体。",
+                    "empty_retrieval": True,
+                    "trace_id": trace_id
+                }
+                return
+
+            # Step 6: 用户手动触发整篇文档召回
+            if retrieve_full_doc and get_config().retrieval.enable_full_document:
+                full_docs = self._retrieve_full_documents(
+                    list({c["file_name"] for c in candidates})
+                )
+                if full_docs:
+                    candidates = full_docs
+
+            # Step 7: 来源复用加权
+            trace["candidates_before_boost"] = len(candidates)
+            candidates = self._boost_historical_sources(
+                candidates, history, boost=cfg.source_boost
             )
-        except ESConnectionError as e:
-            self.logger.error(trace_id, "rag_service", "ES 连接失败", error=str(e))
-            yield {"type": "error", "message": "检索服务暂时不可用，请稍后重试"}
-            return
-        search_time = (time.time() - search_start) * 1000
-        timing["search_ms"] = round(search_time, 1)
+            trace["candidates_after_boost"] = len(candidates)
+            trace["source_boosts"] = {
+                c.get("file_name"): c.get("source_boost", 0)
+                for c in candidates if c.get("source_boost")
+            }
 
-        # Step 3: 可选重排
-        if self.rerank and len(candidates) > top_k:
-            candidates = self.rerank.rerank(rewritten_question, candidates, top_k=top_k)
-        else:
+            # summarize 意图扩大最终返回数量
+            if intent == "summarize":
+                top_k = max(top_k, 10)
+
             candidates = candidates[:top_k]
 
-        # Step 4: 多实体分解检索
-        if not candidates or len(candidates) < 3:
-            entities = self._extract_entities(rewritten_question)
-            if len(entities) >= 2:
-                decomposed = self._multi_entity_retrieve(rewritten_question, entities, top_k)
-                if decomposed:
-                    seen = {c["chunk_id"] for c in candidates}
-                    for c in decomposed:
-                        if c["chunk_id"] not in seen:
-                            candidates.append(c)
-                            seen.add(c["chunk_id"])
-                    timing["decomposed"] = True
-                    timing["decomposed_count"] = len(decomposed)
+            # Step 8: 拼接上下文
+            context = self._build_context(candidates)
 
-        # Step 5: 空检索兜底
-        if not candidates:
-            yield {"type": "error", "message": "知识库中未找到与您问题相关的信息"}
-            return
+            # Step 9: 流式生成
+            llm_start = time.time()
+            answer_parts = []
+            try:
+                async for token in self.llm.generate_stream(
+                    question=question,
+                    context=context,
+                    api_key=api_key,
+                    provider=provider,
+                    model=model,
+                    base_url=base_url,
+                    history=compressed_history,
+                    allow_full_doc_retrieval=(not retrieve_full_doc)
+                ):
+                    answer_parts.append(token)
+                    yield {"type": "token", "content": token}
+            except LLMAPIError as e:
+                self.logger.error(trace_id, "rag_service", "LLM流式调用失败", error=str(e))
+                yield {"type": "error", "message": f"LLM 调用失败: {str(e)}", "suggestion": "请检查 API Key 是否有效、模型名称是否正确，或稍后重试。", "trace_id": trace_id}
+                return
+            llm_time = time.time() - llm_start
+            timing["llm_s"] = round(llm_time, 1)
 
-        # Step 6: 用户手动触发整篇文档召回
-        if retrieve_full_doc and get_config().retrieval.enable_full_document:
-            full_docs = self._retrieve_full_documents(
-                list({c["file_name"] for c in candidates})
-            )
-            if full_docs:
-                candidates = full_docs
+            answer = "".join(answer_parts)
 
-        # Step 7: 来源复用加权
-        candidates = self._boost_historical_sources(
-            candidates, history, boost=cfg.source_boost
-        )
+            # Step 10: 检测 LLM 是否请求查看完整文档
+            requested_file = self._need_full_document(answer)
+            if requested_file and not retrieve_full_doc and get_config().retrieval.enable_full_document:
+                yield {"type": "token", "content": "\n\n[正在召回完整文档...]\n"}
+                full_docs = self._retrieve_full_documents([requested_file])
+                if full_docs:
+                    full_context = self._build_context(full_docs)
+                    answer_parts.clear()
+                    try:
+                        async for token in self.llm.generate_stream(
+                            question=question,
+                            context=full_context,
+                            api_key=api_key,
+                            provider=provider,
+                            model=model,
+                            base_url=base_url,
+                            history=compressed_history,
+                            allow_full_doc_retrieval=False
+                        ):
+                            answer_parts.append(token)
+                            yield {"type": "token", "content": token}
+                        answer = "".join(answer_parts)
+                        candidates = full_docs
+                        timing["full_doc_retrieval"] = True
+                        trace["full_doc_requested"] = True
+                    except LLMAPIError as e:
+                        self.logger.error(trace_id, "rag_service",
+                                          "整篇文档流式重新生成失败", error=str(e))
+                        yield {"type": "error", "message": f"完整文档重新生成失败: {str(e)}", "trace_id": trace_id}
 
-        # summarize 意图扩大最终返回数量
-        if intent == "summarize":
-            top_k = max(top_k, 10)
+            yield {
+                "type": "done",
+                "answer": answer,
+                "sources": [
+                    {
+                        "content": c.get("content", ""),
+                        "file_name": c.get("file_name", ""),
+                        "score": round(c.get("rerank_score", c.get("score", 0)), 3),
+                        "section_title": c.get("section_title", ""),
+                        "chunk_index": c.get("chunk_index", 0),
+                        "is_full_doc": c.get("is_full_doc", False),
+                    }
+                    for c in candidates
+                ],
+                "trace_id": trace_id,
+                "timing": timing,
+                "trace": trace,
+            }
 
-        candidates = candidates[:top_k]
-
-        # Step 8: 拼接上下文
-        context = self._build_context(candidates)
-
-        # Step 9: 流式生成
-        llm_start = time.time()
-        answer_parts = []
-        try:
-            async for token in self.llm.generate_stream(
-                question=question,
-                context=context,
-                api_key=api_key,
-                provider=provider,
-                model=model,
-                base_url=base_url,
-                history=compressed_history,
-                allow_full_doc_retrieval=(not retrieve_full_doc)
-            ):
-                answer_parts.append(token)
-                yield {"type": "token", "content": token}
-        except LLMAPIError as e:
-            self.logger.error(trace_id, "rag_service", "LLM流式调用失败", error=str(e))
-            yield {"type": "error", "message": f"LLM 调用失败: {str(e)}"}
-            return
-        llm_time = time.time() - llm_start
-        timing["llm_s"] = round(llm_time, 1)
-
-        answer = "".join(answer_parts)
-
-        # Step 10: 检测 LLM 是否请求查看完整文档
-        requested_file = self._need_full_document(answer)
-        if requested_file and not retrieve_full_doc and get_config().retrieval.enable_full_document:
-            yield {"type": "token", "content": "\n\n[正在召回完整文档...]\n"}
-            full_docs = self._retrieve_full_documents([requested_file])
-            if full_docs:
-                full_context = self._build_context(full_docs)
-                answer_parts.clear()
-                try:
-                    async for token in self.llm.generate_stream(
-                        question=question,
-                        context=full_context,
-                        api_key=api_key,
-                        provider=provider,
-                        model=model,
-                        base_url=base_url,
-                        history=compressed_history,
-                        allow_full_doc_retrieval=False
-                    ):
-                        answer_parts.append(token)
-                        yield {"type": "token", "content": token}
-                    answer = "".join(answer_parts)
-                    candidates = full_docs
-                    timing["full_doc_retrieval"] = True
-                except LLMAPIError as e:
-                    self.logger.error(trace_id, "rag_service",
-                                      "整篇文档流式重新生成失败", error=str(e))
-
-        yield {
-            "type": "done",
-            "answer": answer,
-            "sources": [
-                {
-                    "content": c.get("content", ""),
-                    "file_name": c.get("file_name", ""),
-                    "score": round(c.get("rerank_score", c.get("score", 0)), 3)
-                }
-                for c in candidates
-            ],
-            "trace_id": trace_id,
-            "timing": timing
-        }
+        except Exception as e:
+            self.logger.error(trace_id, "rag_service", "流式查询未捕获异常", error=str(e))
+            trace["error"] = "internal_error"
+            yield {"type": "error", "message": f"系统异常：{str(e)}", "suggestion": "请稍后重试，或查看后端日志排查问题。", "trace_id": trace_id}
 
     def _query_bm25_fallback(self, question: str, api_key: str,
                              provider: str, model: str,
@@ -538,7 +686,8 @@ class RAGService:
                 "sources": [],
                 "trace_id": trace_id,
                 "fallback": True,
-                "error": "search_unavailable"
+                "error": "search_unavailable",
+                "suggestion": "请检查 Elasticsearch 连接（ES_HOST）是否正确。"
             }
 
         if not results:
@@ -546,7 +695,9 @@ class RAGService:
                 "answer": "抱歉，知识库中未找到相关内容。",
                 "sources": [],
                 "trace_id": trace_id,
-                "fallback": True
+                "fallback": True,
+                "empty_retrieval": True,
+                "suggestion": "建议：1) 尝试用不同关键词提问；2) 上传包含相关内容的文档。"
             }
 
         if retrieve_full_doc:
@@ -584,8 +735,10 @@ class RAGService:
         for i, c in enumerate(candidates, 1):
             score = c.get("rerank_score", c.get("score", 0))
             label = "【完整文档】" if c.get("is_full_doc") else f"【来源{i}】"
+            section = c.get("section_title", "")
+            section_hint = f" (章节: {section})" if section else ""
             context_parts.append(
-                f"{label}{c['file_name']} (相关度: {score:.2f})\n"
+                f"{label}{c['file_name']}{section_hint} (相关度: {score:.2f})\n"
                 f"内容: {c['content']}"
             )
         return "\n\n".join(context_parts)

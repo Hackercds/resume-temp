@@ -3,6 +3,11 @@ import { ApiClient } from './api/client.js';
 
 const app = createApp({
     setup() {
+        // 注册 Service Worker
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('sw.js').catch(() => {});
+        }
+
         const activeTab = ref('chat');
 
         // API 配置
@@ -12,10 +17,19 @@ const app = createApp({
             model: localStorage.getItem('rag_model') || 'gpt-4o-mini',
             baseUrl: localStorage.getItem('rag_base_url') || ''
         });
-        watch(() => apiConfig.apiKey, v => localStorage.setItem('rag_api_key', v));
+        const rememberKey = ref(localStorage.getItem('rag_remember_key') !== 'false');
+        const llmPresets = ref([]);
+        const defaultApiKeyConfigured = ref(false);
+
+        watch(() => apiConfig.apiKey, v => { if (rememberKey.value) localStorage.setItem('rag_api_key', v); });
         watch(() => apiConfig.provider, v => localStorage.setItem('rag_provider', v));
         watch(() => apiConfig.model, v => localStorage.setItem('rag_model', v));
         watch(() => apiConfig.baseUrl, v => localStorage.setItem('rag_base_url', v));
+        watch(rememberKey, v => {
+            localStorage.setItem('rag_remember_key', v ? 'true' : 'false');
+            if (v) localStorage.setItem('rag_api_key', apiConfig.apiKey);
+            else localStorage.removeItem('rag_api_key');
+        });
 
         // 模型建议
         const modelHints = {
@@ -28,18 +42,34 @@ const app = createApp({
         // 系统状态（全局轮询）
         const health = reactive({ embedding_loaded: false, es_connected: false, checking: true });
         let healthTimer = null;
+        const isMobile = ref(window.innerWidth <= 640);
+        const showMobileNav = ref(false);
+        window.addEventListener('resize', () => { isMobile.value = window.innerWidth <= 640; });
 
         async function checkHealth() {
             try {
                 const h = await ApiClient.healthCheck();
                 health.embedding_loaded = h.embedding_loaded;
                 health.es_connected = h.es_connected;
+                health.default_api_key_configured = h.default_api_key_configured;
             } catch (e) { /* 忽略 */ }
             health.checking = false;
         }
 
+        async function loadPublicConfig() {
+            try {
+                const cfg = await ApiClient.getPublicConfig();
+                llmPresets.value = cfg.llm_presets || [];
+                defaultApiKeyConfigured.value = cfg.default_api_key_configured;
+                if (defaultApiKeyConfigured.value && !apiConfig.apiKey) {
+                    apiConfig.apiKey = 'DEFAULT_API_KEY';
+                }
+            } catch (e) { /* 忽略 */ }
+        }
+
         onMounted(() => {
             checkHealth();
+            loadPublicConfig();
             healthTimer = setInterval(checkHealth, 15000); // 15s 刷新
         });
         // cleanup not needed in SPA but included for completeness
@@ -51,15 +81,20 @@ const app = createApp({
             setTimeout(() => notification.value = null, 4000);
         };
 
-        return { activeTab, apiConfig, modelDatalist, health, notification, showNotification };
+        return { activeTab, apiConfig, rememberKey, modelDatalist, llmPresets, defaultApiKeyConfigured, health, isMobile, showMobileNav, notification, showNotification };
     },
 
     template: `
     <div>
-        <div class="header">
+        <div class="app-nav" v-if="isMobile">
+            <button class="menu-btn" @click="showMobileNav = !showMobileNav">☰</button>
+            <span class="header" style="flex:1; text-align:left; padding:0; font-size:18px; font-weight:700;">简历 RAG</span>
+            <span class="status-dot" :class="health.es_connected ? 'ok' : 'fail'" :title="health.es_connected ? 'ES 已连接' : 'ES 未连接'"></span>
+        </div>
+
+        <div class="header" v-if="!isMobile">
             <h1>简历 RAG 智能问答系统</h1>
             <p class="subtitle">本地 Embedding + ES 混合检索 + 在线 LLM</p>
-            <!-- 系统状态条 -->
             <div class="status-bar">
                 <span class="status-dot" :class="health.es_connected ? 'ok' : 'fail'"></span>
                 ES {{ health.checking ? '检测中...' : (health.es_connected ? '已连接' : '未连接') }}
@@ -73,16 +108,10 @@ const app = createApp({
             {{ notification.msg }}
         </div>
 
-        <div class="tabs">
-            <button class="tab-btn" :class="{ active: activeTab === 'chat' }" @click="activeTab = 'chat'">💬 问答</button>
-            <button class="tab-btn" :class="{ active: activeTab === 'knowledge' }" @click="activeTab = 'knowledge'">📚 知识库</button>
-            <button class="tab-btn" :class="{ active: activeTab === 'stats' }" @click="activeTab = 'stats'">📊 统计</button>
-        </div>
-
-        <api-key-config :api-config="apiConfig" :model-datalist="modelDatalist" />
+        <api-key-config v-if="!isMobile || activeTab === 'chat'" :api-config="apiConfig" :remember-key="rememberKey" :model-datalist="modelDatalist" :llm-presets="llmPresets" :default-api-key-configured="defaultApiKeyConfigured" @update:remember-key="rememberKey = $event" />
 
         <div v-show="activeTab === 'chat'">
-            <chat-panel :api-config="apiConfig" :health="health" @notify="showNotification" />
+            <chat-panel :api-config="apiConfig" :health="health" @notify="showNotification" @switch-tab="activeTab = $event" />
         </div>
         <div v-show="activeTab === 'knowledge'">
             <knowledge-panel :health="health" @notify="showNotification" />
@@ -90,22 +119,40 @@ const app = createApp({
         <div v-show="activeTab === 'stats'">
             <stats-panel :health="health" />
         </div>
+
+        <div class="tabs">
+            <button class="tab-btn" :class="{ active: activeTab === 'chat' }" @click="activeTab = 'chat'">💬 问答</button>
+            <button class="tab-btn" :class="{ active: activeTab === 'knowledge' }" @click="activeTab = 'knowledge'">📚 知识库</button>
+            <button class="tab-btn" :class="{ active: activeTab === 'stats' }" @click="activeTab = 'stats'">📊 统计</button>
+        </div>
     </div>
-    `
+    `,
 });
 
 // ==================== API Key 配置 ====================
 app.component('api-key-config', {
-    props: ['apiConfig', 'modelDatalist'],
-    emits: ['update:apiConfig'],
+    props: ['apiConfig', 'rememberKey', 'modelDatalist', 'llmPresets', 'defaultApiKeyConfigured'],
+    emits: ['update:rememberKey'],
     template: `
     <div class="card config-card">
         <div class="config-grid">
-            <div class="field">
+            <div class="field" style="grid-column: span 2;">
                 <label>🔑 API Key</label>
                 <input :type="showKey ? 'text' : 'password'"
                     :value="apiConfig.apiKey" @input="update('apiKey', $event.target.value)"
-                    placeholder="sk-..." />
+                    :placeholder="defaultApiKeyConfigured ? '后端已配置默认 Key，可留空' : 'sk-...'"
+                    :disabled="defaultApiKeyConfigured && apiConfig.apiKey === 'DEFAULT_API_KEY'" />
+                <label class="remember-label">
+                    <input type="checkbox" :checked="rememberKey" @change="$emit('update:rememberKey', $event.target.checked)" />
+                    记住 Key
+                </label>
+            </div>
+            <div class="field">
+                <label>模型预设</label>
+                <select @change="applyPreset($event.target.value)">
+                    <option value="">自定义</option>
+                    <option v-for="p in llmPresets" :key="p.name" :value="p.name">{{ p.name }}</option>
+                </select>
             </div>
             <div class="field">
                 <label>Provider</label>
@@ -136,8 +183,14 @@ app.component('api-key-config', {
     `,
     data() { return { showKey: false }; },
     methods: {
-        // 直接修改父组件的 reactive 对象（同一个引用）
-        update(key, val) { this.apiConfig[key] = val; }
+        update(key, val) { this.apiConfig[key] = val; },
+        applyPreset(name) {
+            const p = (this.llmPresets || []).find(x => x.name === name);
+            if (!p) return;
+            this.apiConfig.provider = p.provider || 'openai';
+            this.apiConfig.model = p.model || '';
+            this.apiConfig.baseUrl = p.base_url || '';
+        }
     }
 });
 
@@ -185,13 +238,21 @@ app.component('chat-panel', {
                                     class="source-item" :class="{ open: expandedMsgIdx === mIdx && expandedIdx === i }"
                                     @click="toggleSource(mIdx, i)">
                                     <div class="source-header">
-                                        <span>{{ s.file_name }}</span>
+                                        <div class="source-meta">
+                                            <span class="source-file">{{ s.file_name }}</span>
+                                            <span v-if="s.section_title" class="source-section">{{ s.section_title }}</span>
+                                            <span class="source-index">#{{ s.chunk_index }}</span>
+                                        </div>
                                         <span class="badge">相关度 {{ s.score }}</span>
                                     </div>
                                     <div class="source-content" v-html="renderMarkdown(s.content)"></div>
                                 </div>
                             </div>
-                            <button v-if="msg.sources && msg.sources.length"
+                            <div v-if="msg.trace" class="trace-box">
+                                <button class="btn-trace-toggle" @click="msg.showTrace = !msg.showTrace">🔍 查看检索过程</button>
+                                <pre v-if="msg.showTrace" class="trace-content">{{ JSON.stringify(msg.trace, null, 2) }}</pre>
+                            </div>
+                            <button v-if="msg.sources && msg.sources.length && !msg.isFullDoc"
                                 class="btn-full-doc" @click="retrieveFullDoc(msg)">
                                 📄 查看完整文档
                             </button>
@@ -205,8 +266,57 @@ app.component('chat-panel', {
             </div>
 
             <!-- 空状态 -->
-            <div v-else-if="!loading" class="empty-state">💡 输入问题，基于知识库智能回答</div>
-            <div v-if="error" class="error-msg">{{ error }}</div>
+            <div v-else-if="!loading" class="empty-state">
+                <div v-if="documents.length === 0" class="onboarding">
+                    <div class="onboarding-icon">🚀</div>
+                    <h3>欢迎使用简历 RAG 智能问答系统</h3>
+                    <p>基于上传的简历/文档，AI 会结合知识库内容回答您的问题。</p>
+                    <div class="onboarding-steps">
+                        <div class="step"><span>1</span> 上传 PDF / TXT / CSV / Markdown 文档</div>
+                        <div class="step"><span>2</span> 配置 API Key（或让管理员后端注入）</div>
+                        <div class="step"><span>3</span> 输入问题，获得带来源引用的回答</div>
+                    </div>
+                    <button class="btn-onboarding" @click="$emit('switch-tab', 'knowledge')">📤 立即上传文档</button>
+                    <div v-if="suggestedQuestions.length" class="suggested-questions">
+                        <p>您也可以试试：</p>
+                        <div class="question-chips">
+                            <button v-for="sq in suggestedQuestions" :key="sq"
+                                class="question-chip" @click="question = sq; doQuery()">{{ sq }}</button>
+                        </div>
+                    </div>
+                </div>
+                <div v-else-if="apiConfig.apiKey">
+                    <p>💡 输入问题，基于知识库智能回答</p>
+                    <div v-if="suggestedQuestions.length" class="suggested-questions">
+                        <p class="input-hint">试试这样问：</p>
+                        <div class="question-chips">
+                            <button v-for="sq in suggestedQuestions" :key="sq"
+                                class="question-chip" @click="question = sq; doQuery()">{{ sq }}</button>
+                        </div>
+                    </div>
+                </div>
+                <div v-else>
+                    <p>⚠️ 请先在上方填入 API Key 才能开始提问</p>
+                </div>
+            </div>
+            <div v-if="error" class="error-msg">
+                <div>{{ error }}</div>
+                <div v-if="errorSuggestion" class="error-suggestion">{{ errorSuggestion }}</div>
+                <div v-if="emptyRetrieval" class="error-actions">
+                    <button class="btn-retry" @click="switchTabToKnowledge">📤 上传文档</button>
+                    <button class="btn-retry" @click="retryQuestion">🔄 换个问法</button>
+                </div>
+                <div v-else-if="errorRetryable" class="error-actions">
+                    <button class="btn-retry" @click="retryLastQuestion">🔄 重试</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 追问建议 -->
+        <div v-if="followUpQuestions.length && !loading" class="follow-up-bar">
+            <span class="follow-up-label">继续问：</span>
+            <button v-for="fq in followUpQuestions" :key="fq"
+                class="question-chip" @click="question = fq; doQuery()">{{ fq }}</button>
         </div>
 
         <!-- 输入区 -->
@@ -233,10 +343,16 @@ app.component('chat-panel', {
             currentSessionId: sid,
             loading: false,
             error: '',
+            errorSuggestion: '',
+            errorRetryable: false,
+            emptyRetrieval: false,
             expandedIdx: -1,
             expandedMsgIdx: -1,
-            maxHistory: 5
-
+            maxHistory: 5,
+            lastQuestion: '',
+            followUpQuestions: [],
+            documents: [],
+            suggestedQuestions: []
         };
     },
     mounted() {
@@ -246,6 +362,8 @@ app.component('chat-panel', {
         } else {
             this.sessions = this._loadSessions();
         }
+        this.loadDocuments();
+        this.generateSuggestedQuestions();
     },
     methods: {
         renderMarkdown(text) {
@@ -276,9 +394,10 @@ app.component('chat-panel', {
             if (typeof retrieveFullDoc !== 'boolean') retrieveFullDoc = false;
             if (!this.question.trim() || !this.apiConfig.apiKey) return;
             const q = this.question.trim();
+            this.lastQuestion = q;
             this.messages.push({ id: Date.now(), role: 'user', content: q, timestamp: Date.now() });
             this.question = '';
-            this.loading = true; this.error = '';
+            this.loading = true; this.error = ''; this.errorSuggestion = ''; this.errorRetryable = false; this.emptyRetrieval = false;
             this.scrollToBottom();
 
             const history = this.messages
@@ -300,6 +419,9 @@ app.component('chat-panel', {
                 sources: [],
                 timing: null,
                 trace_id: '',
+                trace: null,
+                showTrace: false,
+                fullDocs: [],
                 timestamp: Date.now()
             };
             this.messages.push(assistantMsg);
@@ -328,31 +450,60 @@ app.component('chat-panel', {
                         assistantMsg.sources = data.sources || [];
                         assistantMsg.timing = data.timing || null;
                         assistantMsg.trace_id = data.trace_id || '';
+                        assistantMsg.trace = data.trace || null;
+                        this.followUpQuestions = this._generateFollowUpQuestions(data.sources || []);
                         this.saveSession();
                     },
                     (err) => {
                         this.error = err.message;
+                        this.errorSuggestion = err.suggestion || '';
+                        this.emptyRetrieval = !!err.emptyRetrieval;
+                        this.errorRetryable = !this.emptyRetrieval;
+                        // 移除已添加的空白 assistant 消息
+                        const idx = this.messages.findIndex(m => m.id === assistantMsg.id);
+                        if (idx >= 0) this.messages.splice(idx, 1);
                         this.$emit('notify', err.message, 'error');
                     }
                 );
             } catch (e) {
                 this.error = e.message;
+                this.errorSuggestion = e.suggestion || '';
+                this.emptyRetrieval = !!e.emptyRetrieval;
+                this.errorRetryable = !this.emptyRetrieval;
+                const idx = this.messages.findIndex(m => m.id === assistantMsg.id);
+                if (idx >= 0) this.messages.splice(idx, 1);
                 this.$emit('notify', e.message, 'error');
             } finally {
                 this.loading = false;
                 this.scrollToBottom();
             }
         },
+        retryLastQuestion() {
+            if (this.lastQuestion) {
+                this.question = this.lastQuestion;
+                this.doQuery();
+            }
+        },
+        retryQuestion() {
+            if (this.lastQuestion) {
+                // 简单改写：去掉疑问词，换个说法
+                let q = this.lastQuestion.replace(/[吗呢？?]/g, '');
+                if (q === this.lastQuestion) q = '请介绍一下' + this.lastQuestion;
+                this.question = q;
+                this.doQuery();
+            }
+        },
+        switchTabToKnowledge() {
+            this.$emit('switch-tab', 'knowledge');
+        },
         async retrieveFullDoc(lastMsg) {
             if (!lastMsg || !lastMsg.sources || !lastMsg.sources.length) return;
             const idx = this.messages.indexOf(lastMsg);
             if (idx < 0) return;
 
-            // 收集当前答案所对应的问题及前文相关 user 问题，构造更完整的查询
             const priorUserMsgs = this.messages.slice(0, idx).filter(m => m.role === 'user');
             let queryText = '';
             if (priorUserMsgs.length >= 2) {
-                // 取最近两个用户问题，把短指代替换成前一个问题的主体
                 const lastTwo = priorUserMsgs.slice(-2);
                 queryText = `${lastTwo[0].content}；${lastTwo[1].content}`;
             } else if (priorUserMsgs.length === 1) {
@@ -360,55 +511,78 @@ app.component('chat-panel', {
             }
             if (!queryText) return;
 
-            // 取当前答案涉及的所有来源文件，全部召回完整文档
             const targetFiles = [...new Set(lastMsg.sources.map(s => s.file_name))];
             if (!targetFiles.length) return;
 
-            this.loading = true; this.error = '';
-            try {
-                const body = {
-                    question: queryText,
-                    api_key: this.apiConfig.apiKey,
-                    provider: this.apiConfig.provider,
-                    model: this.apiConfig.model || null,
-                    top_k: 5,
-                    history: [],
-                    session_id: this.currentSessionId,
-                    retrieve_full_doc: true
+            this.loading = true; this.error = ''; this.errorSuggestion = ''; this.errorRetryable = false; this.emptyRetrieval = false;
+
+            for (const fileName of targetFiles) {
+                const fullDocMsg = {
+                    id: Date.now() + Math.random(),
+                    role: 'assistant',
+                    content: '',
+                    sources: [],
+                    timing: null,
+                    trace_id: '',
+                    trace: null,
+                    showTrace: false,
+                    fullDocs: [],
+                    isFullDoc: true,
+                    targetFile: fileName,
+                    timestamp: Date.now()
                 };
-                if (this.apiConfig.baseUrl) body.base_url = this.apiConfig.baseUrl;
+                // 追加到当前消息下方，不覆盖原答案
+                this.messages.splice(idx + 1, 0, fullDocMsg);
 
-                const assistantMsg = lastMsg;
-                assistantMsg.content = '';
-                assistantMsg.sources = [];
-                assistantMsg.timing = null;
+                try {
+                    const body = {
+                        question: queryText,
+                        api_key: this.apiConfig.apiKey,
+                        provider: this.apiConfig.provider,
+                        model: this.apiConfig.model || null,
+                        top_k: 5,
+                        history: [],
+                        session_id: this.currentSessionId,
+                        retrieve_full_doc: true
+                    };
+                    if (this.apiConfig.baseUrl) body.base_url = this.apiConfig.baseUrl;
 
-                await ApiClient.queryStream(
-                    body,
-                    (token) => {
-                        assistantMsg.content += token;
-                        this.scrollToBottom();
-                    },
-                    (data) => {
-                        assistantMsg.content = data.answer || assistantMsg.content;
-                        assistantMsg.sources = data.sources || [];
-                        assistantMsg.timing = data.timing || null;
-                        assistantMsg.trace_id = data.trace_id || '';
-                        this.saveSession();
-                    },
-                    (err) => {
-                        this.error = err.message;
-                        this.$emit('notify', err.message, 'error');
-                    }
-                );
-                this.$emit('notify', `已基于完整文档重新生成答案：${targetFiles.join(', ')}`);
-            } catch (e) {
-                this.error = e.message;
-                this.$emit('notify', e.message, 'error');
-            } finally {
-                this.loading = false;
-                this.scrollToBottom();
+                    await ApiClient.queryStream(
+                        body,
+                        (token) => {
+                            fullDocMsg.content += token;
+                            this.scrollToBottom();
+                        },
+                        (data) => {
+                            fullDocMsg.content = data.answer || fullDocMsg.content;
+                            fullDocMsg.sources = data.sources || [];
+                            fullDocMsg.timing = data.timing || null;
+                            fullDocMsg.trace_id = data.trace_id || '';
+                            fullDocMsg.trace = data.trace || null;
+                            this.saveSession();
+                        },
+                        (err) => {
+                            this.error = err.message;
+                            this.errorSuggestion = err.suggestion || '';
+                            this.emptyRetrieval = !!err.emptyRetrieval;
+                            this.errorRetryable = !this.emptyRetrieval;
+                            fullDocMsg.content = `⚠️ ${err.message}`;
+                            this.$emit('notify', err.message, 'error');
+                        }
+                    );
+                } catch (e) {
+                    this.error = e.message;
+                    this.errorSuggestion = e.suggestion || '';
+                    this.emptyRetrieval = !!e.emptyRetrieval;
+                    this.errorRetryable = !this.emptyRetrieval;
+                    fullDocMsg.content = `⚠️ ${e.message}`;
+                    this.$emit('notify', e.message, 'error');
+                }
             }
+
+            this.$emit('notify', `已召回完整文档：${targetFiles.join(', ')}`);
+            this.loading = false;
+            this.scrollToBottom();
         },
         newSession() {
             // 如果当前会话为空，直接复用不新建
@@ -417,6 +591,7 @@ app.component('chat-panel', {
             this.messages = [];
             this.error = '';
             this.question = '';
+            this.followUpQuestions = [];
             this.expandedIdx = -1;
             this.expandedMsgIdx = -1;
         },
@@ -429,6 +604,7 @@ app.component('chat-panel', {
                 this.messages = [];
                 this.error = '';
                 this.question = '';
+                this.followUpQuestions = [];
                 this.expandedIdx = -1;
                 this.expandedMsgIdx = -1;
                 // 重新生成一个空会话 ID，避免后续消息误入已删会话
@@ -481,6 +657,38 @@ app.component('chat-panel', {
                 const el = this.$refs.messageList;
                 if (el) el.scrollTop = el.scrollHeight;
             });
+        },
+        async loadDocuments() {
+            try {
+                const d = await ApiClient.listDocuments();
+                this.documents = d.documents || [];
+            } catch (e) { /* 忽略 */ }
+        },
+        generateSuggestedQuestions() {
+            const samples = [
+                '张成都有几年的工作经验？',
+                '介绍一下张成都的项目经历',
+                '张成都熟悉哪些技术栈？',
+                '总结一下文档中的核心能力',
+                '文档中有哪些关于 Python 的内容？'
+            ];
+            // 如果已上传文档，随机展示 3 个；否则展示 2 个通用引导问题
+            if (this.documents.length > 0) {
+                this.suggestedQuestions = samples.sort(() => 0.5 - Math.random()).slice(0, 3);
+            } else {
+                this.suggestedQuestions = ['如何使用这个系统？', '支持上传哪些文件格式？'];
+            }
+        },
+        _generateFollowUpQuestions(sources) {
+            // 基于来源文件名和章节生成简单追问
+            const questions = [];
+            const files = [...new Set(sources.map(s => s.file_name))].slice(0, 2);
+            for (const fn of files) {
+                const base = fn.replace(/\.[^.]+$/, '');
+                questions.push(`请详细介绍一下 ${base} 的内容`);
+                questions.push(`${base} 中有哪些关键技能？`);
+            }
+            return questions.slice(0, 3);
         }
     }
 });

@@ -143,14 +143,31 @@ SKIP_ES=true ES_HOST=http://192.168.3.184:9200 bash bin/deploy.sh
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/health` | 健康检查 |
-| POST | `/api/query` | RAG 智能问答 |
-| POST | `/api/knowledge/upload` | 上传文档（PDF/TXT/CSV） |
+| GET | `/health` | 健康检查（含 Embedding 状态 + ES 连接） |
+| GET | `/api/config` | 公开配置（LLM 预设、默认 Key 状态） |
+| POST | `/api/query` | RAG 智能问答（同步） |
+| POST | `/api/query/stream` | RAG 流式问答（SSE） |
+| POST | `/api/knowledge/upload` | 上传文档（PDF/TXT/CSV/MD） |
 | GET | `/api/knowledge/documents` | 文档列表 |
 | DELETE | `/api/knowledge/documents/{name}` | 删除文档 |
 | GET | `/api/stats` | 知识库统计 |
 
 完整 API 文档见 `docs/api.md`，或启动后访问 `http://localhost:8080/docs`。
+
+---
+
+## v1.1 升级亮点
+
+- **对话质量**：意图识别（new_topic/follow_up/summarize/clarify）+ 实体继承查询重写 + 来源加权衰减
+- **错误体验**：所有错误带可操作建议，空检索显示"上传文档/换个问法/重试"按钮
+- **Markdown 支持**：`.md`/`.markdown` 文件上传与答案渲染（带代码高亮）
+- **流式问答**：SSE 逐字输出，自动过滤 LLM thinking/reasoning
+- **整篇文档召回**：LLM 可在流式中请求 `{{retrieve_full_doc:文件名}}` 自动召回全文
+- **长文档友好**：标题感知分块（hybrid），来源卡片显示章节标签与 chunk 序号
+- **首次使用**：空会话 onboarding 引导 + 追问建议胶囊 + 模型预设下拉
+- **团队部署**：`DEFAULT_API_KEY` 环境变量注入默认 Key，前端用户无需填写
+- **移动端**：响应式布局 + PWA 离线缓存
+- **一键启动**：`bin/start.sh` / `bin/start.ps1` 自动检测依赖与 ES
 
 ---
 

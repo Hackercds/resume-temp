@@ -1,7 +1,7 @@
 # ============================================================
 # 简历 RAG 智能问答系统 - 唯一配置文件
 # 修改后重新启动服务即可生效
-# 环境变量可覆盖（ES_HOST / APP_PORT / APP_MODE / LOG_LEVEL）
+# 环境变量可覆盖（ES_HOST / APP_PORT / APP_MODE / LOG_LEVEL / DEFAULT_API_KEY）
 # ============================================================
 
 app:
@@ -9,6 +9,7 @@ app:
   host: "0.0.0.0"
   port: 8080
   mode: "release"       # dev 模式自动开启热重载 + CORS *
+  default_api_key: ""   # 团队部署时注入，用户前端无需填写
 
 log:
   level: "debug"
@@ -35,6 +36,7 @@ embedding:
 chunk:
   chunk_size: 400
   overlap: 50
+  strategy: "hybrid"        # fixed(滑动窗口) | semantic(标题语义) | hybrid(标题+滑动窗口)
 
 llm:
   default_provider: "openai"
@@ -42,6 +44,19 @@ llm:
   timeout: 60
   temperature: 0.3
   max_tokens: 1000
+  presets:
+    - name: "OpenAI GPT-4o-mini"
+      provider: "openai"
+      model: "gpt-4o-mini"
+      base_url: ""
+    - name: "硅基流动 DeepSeek-V3"
+      provider: "openai"
+      model: "deepseek-chat"
+      base_url: "https://api.siliconflow.cn/v1"
+    - name: "MiniMax"
+      provider: "openai"
+      model: "abab6.5s-chat"
+      base_url: "https://api.minimax.chat/v1"
 
 rerank:
   enabled: false
@@ -58,7 +73,11 @@ conversation:
   enable_full_document: true
   enable_query_rewrite: true
   source_boost: 0.15
+  source_boost_decay: 5
   summary_threshold: 3
+  enable_intent_llm: false
+  intent_rule_confidence_threshold: 0.85
+  intent_model: "gpt-4o-mini"
 
 cors:
   allowed_origins:

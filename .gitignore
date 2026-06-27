@@ -7,6 +7,7 @@ dist/
 build/
 .eggs/
 *.egg
+.benchmarks/
 
 # Virtual environments
 venv/

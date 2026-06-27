@@ -80,7 +80,11 @@ class ApiClient {
                     } else if (event.type === 'done') {
                         if (onDone) onDone(event);
                     } else if (event.type === 'error') {
-                        if (onError) onError(new Error(event.message));
+                        const err = new Error(event.message || '请求失败');
+                        err.suggestion = event.suggestion || '';
+                        err.emptyRetrieval = !!event.empty_retrieval;
+                        err.traceId = event.trace_id || '';
+                        if (onError) onError(err);
                     }
                 } catch (e) { /* 忽略解析失败的行 */ }
             }
@@ -121,6 +125,14 @@ class ApiClient {
      */
     static async getStats() {
         const res = await fetch(`${API_BASE}/api/stats`);
+        return ApiClient._handleResponse(res);
+    }
+
+    /**
+     * GET /api/config - 公开配置（LLM 预设、默认 Key 状态）
+     */
+    static async getPublicConfig() {
+        const res = await fetch(`${API_BASE}/api/config`);
         return ApiClient._handleResponse(res);
     }
 

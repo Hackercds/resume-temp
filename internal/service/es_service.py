@@ -68,12 +68,6 @@ class ESService:
         """
         RRF (Reciprocal Rank Fusion) 融合 - 面试核心问题：RRF 计算公式？
         score(d) = Σ 1/(k + rank_i(d))
-        其中 k=60 是学术界公认参数
-
-        面试话术：
-        "RRF 对排名取倒数再融合，不受两个子系统分数分布差异影响。
-         向量检索的分数是 [0,2]，BM25 的分数可能是 (0, 30+)，
-         如果直接加权，需要先做归一化，RRF 天然不受影响"
         """
         scores = {}
         for rank, item in enumerate(vector_results):

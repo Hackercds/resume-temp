@@ -4,8 +4,8 @@
 """
 import os
 import yaml
-from typing import List, Optional
-from pydantic import BaseModel
+from typing import List, Optional, Dict
+from pydantic import BaseModel, Field
 
 
 class AppConfig(BaseModel):
@@ -13,6 +13,7 @@ class AppConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8080
     mode: str = "release"
+    default_api_key: str = ""  # 团队部署时注入，用户无需填写
 
 
 class LogConfig(BaseModel):
@@ -42,6 +43,7 @@ class EmbeddingConfig(BaseModel):
 class ChunkConfig(BaseModel):
     chunk_size: int = 400
     overlap: int = 50
+    strategy: str = "fixed"  # fixed | semantic | hybrid
 
 
 class LLMConfig(BaseModel):
@@ -50,6 +52,11 @@ class LLMConfig(BaseModel):
     timeout: int = 60
     temperature: float = 0.3
     max_tokens: int = 1000
+    presets: List[Dict] = Field(default_factory=lambda: [
+        {"name": "OpenAI GPT-4o-mini", "provider": "openai", "model": "gpt-4o-mini", "base_url": ""},
+        {"name": "硅基流动 DeepSeek-V3", "provider": "openai", "model": "deepseek-chat", "base_url": "https://api.siliconflow.cn/v1"},
+        {"name": "MiniMax", "provider": "openai", "model": "abab6.5s-chat", "base_url": "https://api.minimax.chat/v1"},
+    ])
 
 
 class RerankConfig(BaseModel):
@@ -69,7 +76,11 @@ class ConversationConfig(BaseModel):
     enable_full_document: bool = True
     enable_query_rewrite: bool = True
     source_boost: float = 0.15
+    source_boost_decay: int = 5
     summary_threshold: int = 3
+    enable_intent_llm: bool = False
+    intent_rule_confidence_threshold: float = 0.85
+    intent_model: str = "gpt-4o-mini"
 
 
 class CorsConfig(BaseModel):
@@ -114,6 +125,8 @@ def load_config(config_path: str = "config/config.yaml") -> Config:
         config_data.setdefault("app", {})["port"] = int(os.getenv("APP_PORT"))
     if os.getenv("APP_MODE"):
         config_data.setdefault("app", {})["mode"] = os.getenv("APP_MODE")
+    if os.getenv("DEFAULT_API_KEY"):
+        config_data.setdefault("app", {})["default_api_key"] = os.getenv("DEFAULT_API_KEY")
     if os.getenv("LOG_LEVEL"):
         config_data.setdefault("log", {})["level"] = os.getenv("LOG_LEVEL")
 
