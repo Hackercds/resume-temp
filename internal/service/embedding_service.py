@@ -66,12 +66,30 @@ class EmbeddingService:
                               "设备检测", device=device)
 
             # 优先用 Docker 预下载的本地模型
+            # 路径 1: ./models/bge-model （Docker 预下载）
+            # 路径 2: ./models/models--BAAI--bge-small-zh-v1.5/snapshots/<hash>/ （HF 默认缓存）
             local_path = os.path.join(self.cache_folder, "bge-model")
             abs_local = os.path.abspath(local_path)
             self.logger.debug("load_model", "embedding",
                               "检查本地模型路径",
                               path=abs_local,
                               exists=os.path.isdir(abs_local))
+
+            if not os.path.isdir(abs_local):
+                # 检查 HuggingFace 默认快照目录
+                hf_cache = os.path.join(
+                    self.cache_folder,
+                    f"models--{self.model_name.replace('/', '--')}",
+                    "snapshots"
+                )
+                if os.path.isdir(hf_cache):
+                    snapshots = [d for d in os.listdir(hf_cache)
+                                 if os.path.isdir(os.path.join(hf_cache, d))]
+                    if snapshots:
+                        abs_local = os.path.join(hf_cache, snapshots[0])
+                        self.logger.info("load_model", "embedding",
+                                         "✓ 使用 HuggingFace 缓存快照",
+                                         path=abs_local)
 
             if os.path.isdir(abs_local):
                 # 列出路径下的文件

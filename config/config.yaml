@@ -64,7 +64,7 @@ rerank:
 
 retrieval:
   top_k: 5
-  min_score: 0.5
+  min_score: 0.0            # RRF 融合后分数 ≤ 0.033，阈值默认 0，由 RRF 排名决定
   enable_full_document: true
 
 conversation:

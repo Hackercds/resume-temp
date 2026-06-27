@@ -66,7 +66,7 @@ class RerankConfig(BaseModel):
 
 class RetrievalConfig(BaseModel):
     top_k: int = 5
-    min_score: float = 0.5
+    min_score: float = 0.0  # RRF 融合后分数 ≤ 0.033；阈值默认关闭，由 RRF 排名决定
     enable_full_document: bool = True
 
 

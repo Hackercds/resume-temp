@@ -93,13 +93,30 @@ class ApiClient {
 
     /**
      * POST /api/knowledge/upload - 上传文档
+     * onProgress: 0-100 上传进度
      */
-    static async uploadDocument(formData) {
-        const res = await fetch(`${API_BASE}/api/knowledge/upload`, {
-            method: 'POST',
-            body: formData  // FormData, 不设 Content-Type 让浏览器自动加 boundary
+    static async uploadDocument(formData, onProgress) {
+        return new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            if (typeof onProgress === 'function') {
+                xhr.upload.addEventListener('progress', (e) => {
+                    if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
+                });
+            }
+            xhr.addEventListener('load', () => {
+                try {
+                    const data = JSON.parse(xhr.responseText);
+                    if (data.code === 0) resolve(data.data);
+                    else reject(new Error(data.message || `上传失败 (${xhr.status})`));
+                } catch (e) {
+                    reject(new Error('响应解析失败'));
+                }
+            });
+            xhr.addEventListener('error', () => reject(new Error('网络错误')));
+            xhr.addEventListener('abort', () => reject(new Error('已取消')));
+            xhr.open('POST', `${API_BASE}/api/knowledge/upload`);
+            xhr.send(formData);
         });
-        return ApiClient._handleResponse(res);
     }
 
     /**
