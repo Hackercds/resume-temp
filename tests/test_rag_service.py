@@ -196,6 +196,120 @@ class TestMultiEntityRetrieval:
         assert all(t not in ('这个', '那个', '什么', '区别', '请问') for t in terms)
 
 
+class TestRetrieveFullDocMarks:
+    """测试 {{retrieve_full_doc:...}} 标记的处理：解析多个 + 清理泄露"""
+
+    def test_strip_single_mark(self):
+        from internal.service.rag_service import RAGService
+        rag = RAGService.__new__(RAGService)
+        text = "这里是答案。\n{{retrieve_full_doc:a.pdf}}\n剩余内容"
+        cleaned = rag._strip_retrieve_marks(text)
+        assert "{{retrieve_full_doc" not in cleaned
+        assert "这里是答案" in cleaned
+        assert "剩余内容" in cleaned
+
+    def test_strip_multiple_marks(self):
+        from internal.service.rag_service import RAGService
+        rag = RAGService.__new__(RAGService)
+        text = "{{retrieve_full_doc:a.pdf}}\n中间内容\n{{retrieve_full_doc:b.pdf}}\n结束"
+        cleaned = rag._strip_retrieve_marks(text)
+        assert "{{retrieve_full_doc" not in cleaned
+        assert "中间内容" in cleaned
+        assert "结束" in cleaned
+
+    def test_strip_with_whitespace(self):
+        from internal.service.rag_service import RAGService
+        rag = RAGService.__new__(RAGService)
+        text = "内容 {{retrieve_full_doc:x.pdf}} 后续"
+        cleaned = rag._strip_retrieve_marks(text)
+        assert cleaned == "内容  后续"
+
+    def test_strip_empty_text(self):
+        from internal.service.rag_service import RAGService
+        rag = RAGService.__new__(RAGService)
+        assert rag._strip_retrieve_marks("") == ""
+        assert rag._strip_retrieve_marks(None) is None
+
+    def test_strip_no_mark(self):
+        from internal.service.rag_service import RAGService
+        rag = RAGService.__new__(RAGService)
+        text = "普通答案，没有标记"
+        assert rag._strip_retrieve_marks(text) == text
+
+    def test_need_full_documents_single(self):
+        """单标记 → 单文件"""
+        from internal.service.rag_service import RAGService
+        rag = RAGService.__new__(RAGService)
+        text = "需要更多 {{retrieve_full_doc:a.pdf}} 内容"
+        files = rag._need_full_documents(text)
+        assert files == ["a.pdf"]
+
+    def test_need_full_documents_multiple(self):
+        """多标记 → 多文件（去重保序）"""
+        from internal.service.rag_service import RAGService
+        rag = RAGService.__new__(RAGService)
+        text = "{{retrieve_full_doc:a.pdf}}\n和\n{{retrieve_full_doc:b.pdf}}\n不要\n{{retrieve_full_doc:a.pdf}}"
+        files = rag._need_full_documents(text)
+        assert files == ["a.pdf", "b.pdf"]
+
+    def test_need_full_documents_none(self):
+        """无标记 → 空列表"""
+        from internal.service.rag_service import RAGService
+        rag = RAGService.__new__(RAGService)
+        assert rag._need_full_documents("普通文本") == []
+
+    def test_need_full_document_legacy(self):
+        """旧 API 仍然返回第一个标记（向后兼容）"""
+        from internal.service.rag_service import RAGService
+        rag = RAGService.__new__(RAGService)
+        text = "{{retrieve_full_doc:a.pdf}}\n{{retrieve_full_doc:b.pdf}}"
+        assert rag._need_full_document(text) == "a.pdf"
+
+    @patch('internal.service.rag_service.EmbeddingService')
+    @patch('internal.service.rag_service.ESService')
+    @patch('internal.service.rag_service.LLMService')
+    def test_query_strips_mark_from_final_answer(self, mock_llm, mock_es, mock_emb):
+        """query 完整流程：答案中的标记会被剥离后再返回"""
+        from internal.service.rag_service import RAGService
+
+        mock_emb_instance = MagicMock()
+        mock_emb_instance.encode_query.return_value = np.random.randn(512).astype(np.float32)
+        mock_emb.return_value = mock_emb_instance
+
+        mock_es_instance = MagicMock()
+        mock_es_instance.search_hybrid.return_value = [
+            {"chunk_id": "c1", "content": "x", "file_name": "a.pdf", "score": 0.5}
+        ]
+        # 全文召回返回完整文档
+        mock_es_instance.retrieve_full_document.return_value = {
+            "chunk_id": "a.pdf__full_doc", "content": "完整内容", "file_name": "a.pdf",
+            "score": 0, "is_full_doc": True
+        }
+        mock_es.return_value = mock_es_instance
+
+        # LLM 第一次返回带标记的答案，第二次返回不带标记
+        mock_llm_instance = MagicMock()
+        mock_llm_instance.generate.side_effect = [
+            "需要更多细节 {{retrieve_full_doc:a.pdf}}",
+            "完整内容已生成"
+        ]
+        mock_llm.return_value = mock_llm_instance
+
+        rag = RAGService(
+            embedding_service=mock_emb_instance,
+            es_service=mock_es_instance,
+            llm_service=mock_llm_instance
+        )
+
+        result = rag.query(question="细节", api_key="sk-test")
+
+        # 最终答案不应包含标记
+        assert "{{retrieve_full_doc" not in result["answer"]
+        assert result["answer"] == "完整内容已生成"
+        # trace 中应记录触发了全文召回
+        assert result["trace"]["full_doc_requested"] is True
+
+
 class TestRateLimiter:
     """限流器测试"""
 

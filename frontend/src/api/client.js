@@ -47,6 +47,9 @@ class ApiClient {
             retrieve_full_doc: body.retrieve_full_doc || false
         };
 
+        // 兜底：即使后端漏过滤，前端再清一遍 {{retrieve_full_doc:...}} 标记
+        const STRIP_RETRIEVE = /\{\{retrieve_full_doc:[^}]+\}\}\s*/g;
+
         const res = await fetch(`${API_BASE}/api/query/stream`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -76,15 +79,21 @@ class ApiClient {
                 try {
                     const event = JSON.parse(dataStr);
                     if (event.type === 'token') {
-                        if (onToken) onToken(event.content);
-                    } else if (event.type === 'done') {
-                        if (onDone) onDone(event);
+                        // 流式：过滤 retrieve_full_doc 标记
+                        const cleaned = (event.content || '').replace(STRIP_RETRIEVE, '');
+                        if (cleaned && onToken) onToken(cleaned);
                     } else if (event.type === 'error') {
                         const err = new Error(event.message || '请求失败');
                         err.suggestion = event.suggestion || '';
                         err.emptyRetrieval = !!event.empty_retrieval;
                         err.traceId = event.trace_id || '';
                         if (onError) onError(err);
+                    } else if (event.type === 'done') {
+                        // done：兜底清理 answer 中的残留标记
+                        if (event.answer) {
+                            event.answer = event.answer.replace(STRIP_RETRIEVE, '').trim();
+                        }
+                        if (onDone) onDone(event);
                     }
                 } catch (e) { /* 忽略解析失败的行 */ }
             }

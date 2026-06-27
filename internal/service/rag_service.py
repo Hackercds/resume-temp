@@ -348,12 +348,12 @@ class RAGService:
             llm_time = time.time() - llm_start
             timing["llm_s"] = round(llm_time, 1)
 
-            # Step 10: 检测 LLM 是否请求查看完整文档
-            requested_file = self._need_full_document(answer)
-            if requested_file and not retrieve_full_doc and get_config().retrieval.enable_full_document:
+            # Step 10: 检测 LLM 请求的所有完整文档（去重保序，逐个召回）
+            requested_files = self._need_full_documents(answer)
+            if requested_files and not retrieve_full_doc and get_config().retrieval.enable_full_document:
                 self.logger.info(trace_id, "rag_service",
-                                 "LLM 请求召回整篇文档", file_name=requested_file)
-                full_docs = self._retrieve_full_documents([requested_file])
+                                 "LLM 请求召回整篇文档", files=requested_files)
+                full_docs = self._retrieve_full_documents(requested_files)
                 if full_docs:
                     full_context = self._build_context(full_docs)
                     try:
@@ -370,9 +370,13 @@ class RAGService:
                         candidates = full_docs
                         timing["full_doc_retrieval"] = True
                         trace["full_doc_requested"] = True
+                        trace["full_doc_files"] = requested_files
                     except LLMAPIError as e:
                         self.logger.error(trace_id, "rag_service",
                                           "整篇文档重新生成失败", error=str(e))
+
+            # 清理答案中可能残留的 retrieve_full_doc 标记（防泄露给用户）
+            answer = self._strip_retrieve_marks(answer)
 
             # 构造返回
             return self._build_success_response(
@@ -591,7 +595,7 @@ class RAGService:
             # Step 8: 拼接上下文
             context = self._build_context(candidates)
 
-            # Step 9: 流式生成
+            # Step 9: 流式生成（同时过滤 retrieve_full_doc 标记，避免泄露给用户）
             llm_start = time.time()
             answer_parts = []
             try:
@@ -605,8 +609,12 @@ class RAGService:
                     history=compressed_history,
                     allow_full_doc_retrieval=(not retrieve_full_doc)
                 ):
-                    answer_parts.append(token)
-                    yield {"type": "token", "content": token}
+                    # 过滤掉 retrieve_full_doc 标记：把标记拆开，按字符逐个输出
+                    # 如果 token 包含标记，把标记部分替换为空再输出
+                    cleaned_token = self._strip_retrieve_marks(token)
+                    if cleaned_token:  # 跳过空 token（标记整段被吃掉）
+                        answer_parts.append(cleaned_token)
+                        yield {"type": "token", "content": cleaned_token}
             except LLMAPIError as e:
                 self.logger.error(trace_id, "rag_service", "LLM流式调用失败", error=str(e))
                 yield {"type": "error", "message": f"LLM 调用失败: {str(e)}", "suggestion": "请检查 API Key 是否有效、模型名称是否正确，或稍后重试。", "trace_id": trace_id}
@@ -614,16 +622,23 @@ class RAGService:
             llm_time = time.time() - llm_start
             timing["llm_s"] = round(llm_time, 1)
 
+            # answer_parts 已经过滤标记，但若标记被截断到两个 token 中间，
+            # 仍可能残留完整标记，需再次清理
             answer = "".join(answer_parts)
+            answer = self._strip_retrieve_marks(answer)
+            answer_parts = [answer]  # 后续以清理后的内容继续
 
-            # Step 10: 检测 LLM 是否请求查看完整文档
-            requested_file = self._need_full_document(answer)
-            if requested_file and not retrieve_full_doc and get_config().retrieval.enable_full_document:
+            # Step 10: 检测 LLM 请求的所有完整文档（去重保序，逐个召回）
+            requested_files = self._need_full_documents(answer)
+            if requested_files and not retrieve_full_doc and get_config().retrieval.enable_full_document:
+                self.logger.info(trace_id, "rag_service",
+                                 "流式查询 LLM 请求召回整篇文档",
+                                 files=requested_files)
                 yield {"type": "token", "content": "\n\n[正在召回完整文档...]\n"}
-                full_docs = self._retrieve_full_documents([requested_file])
+                full_docs = self._retrieve_full_documents(requested_files)
                 if full_docs:
                     full_context = self._build_context(full_docs)
-                    answer_parts.clear()
+                    answer_parts = []
                     try:
                         async for token in self.llm.generate_stream(
                             question=question,
@@ -635,12 +650,17 @@ class RAGService:
                             history=compressed_history,
                             allow_full_doc_retrieval=False
                         ):
-                            answer_parts.append(token)
-                            yield {"type": "token", "content": token}
+                            # 全文召回阶段也过滤可能的标记
+                            cleaned_token = self._strip_retrieve_marks(token)
+                            if cleaned_token:
+                                answer_parts.append(cleaned_token)
+                                yield {"type": "token", "content": cleaned_token}
                         answer = "".join(answer_parts)
+                        answer = self._strip_retrieve_marks(answer)
                         candidates = full_docs
                         timing["full_doc_retrieval"] = True
                         trace["full_doc_requested"] = True
+                        trace["full_doc_files"] = requested_files
                     except LLMAPIError as e:
                         self.logger.error(trace_id, "rag_service",
                                           "整篇文档流式重新生成失败", error=str(e))
@@ -744,11 +764,28 @@ class RAGService:
         return "\n\n".join(context_parts)
 
     def _need_full_document(self, answer: str) -> Optional[str]:
-        """检测 LLM 是否请求查看完整文档"""
+        """检测 LLM 是否请求查看完整文档（取第一个匹配）"""
         m = self._RETRIEVE_MARK.search(answer)
         if m:
             return m.group(1).strip()
         return None
+
+    def _need_full_documents(self, answer: str) -> List[str]:
+        """检测 LLM 请求的所有完整文档（去重保序）"""
+        seen = set()
+        result = []
+        for m in self._RETRIEVE_MARK.finditer(answer):
+            fn = m.group(1).strip()
+            if fn and fn not in seen:
+                seen.add(fn)
+                result.append(fn)
+        return result
+
+    def _strip_retrieve_marks(self, text: str) -> str:
+        """从答案中移除所有 retrieve_full_doc 标记（防止泄露给用户）"""
+        if not text:
+            return text
+        return self._RETRIEVE_MARK.sub("", text).strip()
 
     def _retrieve_full_documents(self, file_names: List[str]) -> List[Dict]:
         """按 file_name 召回整篇文档"""
