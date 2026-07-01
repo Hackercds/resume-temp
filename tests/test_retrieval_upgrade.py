@@ -59,7 +59,7 @@ class TestFullDocExclusion:
     """父文档（is_full_doc=true）不应参与向量/关键词检索"""
 
     def test_search_by_vector_excludes_full_doc(self):
-        """向量检索 body 含 is_full_doc=False 过滤"""
+        """向量检索用 must_not(term:true) 排除父文档（兼容字段缺失的常规 chunk）"""
         from internal.repository.es_repository import ESRepository
         repo = ESRepository.__new__(ESRepository)
         repo.logger = MagicMock()
@@ -74,11 +74,11 @@ class TestFullDocExclusion:
 
         body = mock_es.search.call_args.kwargs.get("body") or mock_es.search.call_args.args[1]
         query = body["query"]
-        # 应包含 bool.filter term is_full_doc=False
         assert "script_score" in query
         inner = query["script_score"]["query"]
+        # 应是 bool.must_not(term:true)，而非 term:false（后者会误排除字段缺失的常规 chunk）
         assert "bool" in inner
-        assert {"term": {"is_full_doc": False}} in inner["bool"]["filter"]
+        assert {"term": {"is_full_doc": True}} in inner["bool"]["must_not"]
 
     def test_search_by_vector_can_include_full_doc(self):
         """exclude_full_doc=False 时不加过滤（用于全文召回路径）"""
@@ -100,7 +100,7 @@ class TestFullDocExclusion:
         assert inner == {"match_all": {}}
 
     def test_search_by_keyword_excludes_full_doc(self):
-        """BM25 检索 body 含 is_full_doc=False 过滤"""
+        """BM25 检索用 must_not(term:true) 排除父文档"""
         from internal.repository.es_repository import ESRepository
         repo = ESRepository.__new__(ESRepository)
         repo.logger = MagicMock()
@@ -114,7 +114,43 @@ class TestFullDocExclusion:
 
         body = mock_es.search.call_args.kwargs.get("body") or mock_es.search.call_args.args[1]
         bool_body = body["query"]["bool"]
-        assert {"term": {"is_full_doc": False}} in bool_body["filter"]
+        assert {"term": {"is_full_doc": True}} in bool_body["must_not"]
+
+    def test_regular_chunks_without_field_are_not_excluded(self):
+        """
+        回归测试：常规 chunk 入库时未写 is_full_doc（字段缺失），
+        检索必须仍能命中——不能用 term:false（会误排除缺失字段文档）。
+        这是 v1.2 升级的关键数据语义：must_not(term:true) 而非 term:false。
+        """
+        from internal.repository.es_repository import ESRepository
+        repo = ESRepository.__new__(ESRepository)
+        repo.logger = MagicMock()
+        repo.index = "test_idx"
+
+        captured_bodies = []
+        mock_es = MagicMock()
+        # 模拟 ES 返回一条常规 chunk（_source 里没有 is_full_doc 字段）
+        mock_es.search.side_effect = lambda *a, **k: (
+            captured_bodies.append(k.get("body") or (a[1] if len(a) > 1 else None)),
+            {"hits": {"hits": [{"_source": {"chunk_id": "c1", "content": "x",
+                                            "file_name": "a.pdf", "chunk_index": 0},
+                                 "_score": 1.5}]}})[1]
+        repo.connect = MagicMock(return_value=mock_es)
+
+        qv = np.random.randn(512).astype(np.float32)
+        results = repo.search_by_vector(qv, size=5)
+        # 常规 chunk（字段缺失）应被返回，不被 must_not 误排除
+        assert len(results) == 1
+        assert results[0]["chunk_id"] == "c1"
+        # 验证查询体用的是 must_not(term:true)，不是 term:false
+        body = captured_bodies[0]
+        inner = body["query"]["script_score"]["query"]
+        assert "bool" in inner
+        assert "must_not" in inner["bool"]
+        assert {"term": {"is_full_doc": True}} in inner["bool"]["must_not"]
+        # 关键：filter 里不能有 term:is_full_doc=false
+        filters = inner["bool"].get("filter", [])
+        assert not any(f == {"term": {"is_full_doc": False}} for f in filters)
 
 
 # ==================== 邻域上下文扩展 ====================
@@ -196,7 +232,7 @@ class TestNeighborExpansion:
         assert result == candidates
 
     def test_search_neighbor_chunks_builds_correct_query(self):
-        """邻域查询按 file_name + terms(chunk_index) + is_full_doc=False 过滤"""
+        """邻域查询按 file_name + terms(chunk_index) + must_not(is_full_doc=true) 过滤"""
         from internal.repository.es_repository import ESRepository
         repo = ESRepository.__new__(ESRepository)
         repo.logger = MagicMock()
@@ -207,9 +243,11 @@ class TestNeighborExpansion:
 
         repo.search_neighbor_chunks("a.pdf", [1, 3])
         body = mock_es.search.call_args.kwargs.get("body") or mock_es.search.call_args.args[1]
-        filters = body["query"]["bool"]["filter"]
+        bool_body = body["query"]["bool"]
+        filters = bool_body["filter"]
         assert {"term": {"file_name": "a.pdf"}} in filters
-        assert {"term": {"is_full_doc": False}} in filters
+        # is_full_doc 排除应放在 must_not（兼容字段缺失），不在 filter
+        assert {"term": {"is_full_doc": True}} in bool_body["must_not"]
         # terms 含 1 和 3
         terms_filter = next(f for f in filters if "terms" in f)
         assert set(terms_filter["terms"]["chunk_index"]) == {1, 3}

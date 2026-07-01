@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## [1.2.1] - 2026-07-02
+
+### Fixed
+- **关键修复：父文档过滤误排除常规 chunk**。v1.2.0 用 `term: is_full_doc=false` 过滤父文档，
+  但常规 chunk 入库时未写 `is_full_doc` 字段（值缺失），ES 中 `term:false` 不命中字段缺失文档，
+  导致常规 chunk 被误排除、检索结果为空。改为 `must_not: [{term: {is_full_doc: true}}]`，
+  只排除父文档，保留所有常规 chunk（含字段缺失的历史数据）。
+  - `search_by_vector` / `search_by_keyword` / `search_neighbor_chunks` 三处过滤全部修正
+  - `bulk_insert` 入库时显式写 `is_full_doc: false`，保证新数据字段完整
+  - 新增回归测试 `test_regular_chunks_without_field_are_not_excluded` 锁定该数据语义
+
 ## [1.2.0] - 2026-07-02
 
 ### 检索召回质量升级（从技术栈原理底层优化）

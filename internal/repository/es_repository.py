@@ -212,10 +212,12 @@ class ESRepository:
                 "char_count": chunk.get("char_count", len(chunk["content"])),
                 "section_title": chunk.get("section_title", ""),
                 "upload_time": chunk.get("upload_time", now),
+                # 常规 chunk 显式标记 is_full_doc=false，保证字段完整；
+                # 检索时用 must_not(term:true) 排除父文档，兼容历史未写该字段的数据
+                "is_full_doc": bool(chunk.get("is_full_doc", False)),
                 "vector": vector.tolist()
             }
             if chunk.get("is_full_doc"):
-                source["is_full_doc"] = True
                 source["full_text"] = chunk.get("full_text", chunk["content"])
                 source["doc_id"] = chunk.get("doc_id", chunk["file_name"])
             actions.append({
@@ -274,17 +276,24 @@ class ESRepository:
         答：入库时父文档的 vector 只编码了「前 chunk_size 字」的向量，
             它会以首段语义匹配、并挤占 top_k，污染检索结果。
             父文档应只通过 retrieve_full_document 按 file_name 精确召回。
+
+        面试点：为什么用 must_not(term:true) 而不是 term:false？
+        答：常规 chunk 入库时未显式写 is_full_doc 字段（值为缺失/null）。
+           ES 中 term:false 只命中显式等于 false 的文档，**不命中字段缺失的文档**，
+           若用 term:false 会把所有常规 chunk 误排除，导致检索为空。
+           must_not(term:true) 只排除父文档，其余（含字段缺失的常规 chunk）全部保留。
         """
         es = self.connect()
-        query_filter = []
         if exclude_full_doc:
-            query_filter.append({"term": {"is_full_doc": False}})
+            inner_query = {"bool": {"must_not": [{"term": {"is_full_doc": True}}]}}
+        else:
+            inner_query = {"match_all": {}}
 
         body = {
             "size": size,
             "query": {
                 "script_score": {
-                    "query": {"bool": {"filter": query_filter}} if query_filter else {"match_all": {}},
+                    "query": inner_query,
                     "script": {
                         "source": "cosineSimilarity(params.query_vector, 'vector') + 1.0",
                         "params": {"query_vector": query_vector.tolist()}
@@ -312,13 +321,12 @@ class ESRepository:
         """
         BM25 关键词检索 - 面试点：ES match query 默认使用 BM25 算法
         为什么保留这个？即使 embedding 不可用，基本搜索功能仍可用（降级方案）
-        exclude_full_doc：同 search_by_vector，排除父文档避免污染。
+        exclude_full_doc：同 search_by_vector，用 must_not 排除父文档（兼容字段缺失的常规 chunk）。
         """
         es = self.connect()
-        must = [{"match": {"content": {"query": query_text, "operator": "or"}}}]
-        bool_body = {"must": must}
+        bool_body = {"must": [{"match": {"content": {"query": query_text, "operator": "or"}}}]}
         if exclude_full_doc:
-            bool_body["filter"] = [{"term": {"is_full_doc": False}}]
+            bool_body["must_not"] = [{"term": {"is_full_doc": True}}]
 
         body = {
             "size": size,
@@ -350,7 +358,8 @@ class ESRepository:
         if not file_name or not chunk_indices:
             return []
         es = self.connect()
-        # 用 terms 一次查回所有目标 chunk_index
+        # 用 terms 一次查回所有目标 chunk_index；is_full_doc 用 must_not 排除父文档
+        # （常规 chunk 字段缺失，必须用 must_not 而非 term:false，详见 search_by_vector 注释）
         body = {
             "size": len(chunk_indices) * 2 + 4,
             "query": {
@@ -358,8 +367,8 @@ class ESRepository:
                     "filter": [
                         {"term": {"file_name": file_name}},
                         {"terms": {"chunk_index": chunk_indices}},
-                        {"term": {"is_full_doc": False}}
-                    ]
+                    ],
+                    "must_not": [{"term": {"is_full_doc": True}}]
                 }
             },
             "_source": ["chunk_id", "content", "file_name", "chunk_index", "section_title"],
