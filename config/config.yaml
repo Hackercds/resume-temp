@@ -37,6 +37,7 @@ chunk:
   chunk_size: 400
   overlap: 50
   strategy: "hybrid"        # fixed(滑动窗口) | semantic(标题语义) | hybrid(标题+滑动窗口)
+  csv_inject_header: true   # CSV 每行分块时注入表头，保持每行语义完整
 
 llm:
   default_provider: "openai"
@@ -66,6 +67,8 @@ retrieval:
   top_k: 5
   min_score: 0.0            # RRF 融合后分数 ≤ 0.033，阈值默认 0，由 RRF 排名决定
   enable_full_document: true
+  enable_neighbor_expansion: true   # 命中 chunk 后召回同文档相邻块拼接上下文
+  neighbor_window: 1                  # 前后各扩展 N 个 chunk
 
 conversation:
   max_history: 5
@@ -78,6 +81,9 @@ conversation:
   enable_intent_llm: false
   intent_rule_confidence_threshold: 0.85
   intent_model: "gpt-4o-mini"
+  follow_up_vector_use_expanded: true   # 追问向量用纯实体消解版，避免对话噪音污染语义空间
+  enable_query_vector_cache: true       # 相同问题复用向量，避免重复推理
+  query_vector_cache_size: 128
 
 cors:
   allowed_origins:

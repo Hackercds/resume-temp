@@ -42,9 +42,10 @@ class RAGService:
         self.intent = IntentService(llm_service=self.llm)
         self.logger = get_logger()
 
-    def _classify_intent(self, question: str, history: List[Dict]) -> str:
-        """调用 IntentService 进行意图识别"""
-        intent, _ = self.intent.classify(question, history)
+    def _classify_intent(self, question: str, history: List[Dict],
+                         llm_kwargs: Dict = None) -> str:
+        """调用 IntentService 进行意图识别（规则优先，可选 LLM 兜底）"""
+        intent, _ = self.intent.classify(question, history, llm_kwargs=llm_kwargs)
         return intent
 
     def _rewrite_query(self, question: str, intent: str, history: List[Dict]) -> Dict:
@@ -153,21 +154,39 @@ class RAGService:
     def _compress_history(self, history: List[Dict], threshold: int = 3) -> List[Dict]:
         """
         压缩历史：保留最近 2 轮完整内容，更早的历史生成摘要。
-        当前使用规则摘要（取 user 消息拼接），后续可升级为 LLM 摘要。
+        面试点：旧版只保留 user 问句，丢失 assistant 答案导致长对话失忆；
+            改进后把更早的「问→答」配对压缩成「用户问了X，助手答了Y要点」，
+            保留关键结论，让 LLM 在长对话中仍有记忆。
         """
         if not history or len(history) <= threshold * 2:
             return history
 
-        # 最近 2 轮完整保留
+        # 最近 2 轮完整保留（一轮 = user + assistant）
         recent = history[-4:]
         older = history[:-4]
 
-        # 规则摘要：提取更早历史中的 user 问题
-        older_questions = [m.get("content", "")[:80]
-                           for m in older if m.get("role") == "user"]
-        summary = "；".join(older_questions)
-        if len(summary) > 400:
-            summary = summary[:400] + "..."
+        # 把 older 按 user/assistant 配对，压缩成摘要要点
+        summary_parts = []
+        pending_q = None
+        for m in older:
+            role = m.get("role")
+            content = (m.get("content") or "").strip()
+            if role == "user" and content:
+                pending_q = content[:80]
+            elif role == "assistant" and content:
+                ans_brief = content[:120].replace("\n", " ")
+                if pending_q:
+                    summary_parts.append(f"用户问「{pending_q}」，助手答「{ans_brief}…」")
+                else:
+                    summary_parts.append(f"助手答「{ans_brief}…」")
+                pending_q = None
+        # 残留未配对的 user 问题也保留
+        if pending_q:
+            summary_parts.append(f"用户问「{pending_q}」")
+
+        summary = "；".join(summary_parts)
+        if len(summary) > 600:
+            summary = summary[:600] + "..."
 
         compressed = [{"role": "system", "content": f"更早的对话摘要：{summary}"}]
         compressed.extend(recent)
@@ -200,7 +219,9 @@ class RAGService:
 
         try:
             # 意图识别 + 查询重写
-            intent = self._classify_intent(question, history)
+            intent = self._classify_intent(question, history, llm_kwargs={
+                "api_key": api_key, "provider": provider, "model": model, "base_url": base_url
+            })
             rewritten = self._rewrite_query(question, intent, history)
             trace["intent"] = intent
             trace["expanded_question"] = rewritten.get("expanded", question)
@@ -222,7 +243,18 @@ class RAGService:
             # Step 1: 查询向量化（使用重写后的问题）
             embed_start = time.time()
             try:
-                query_vector = self.embedding.encode_query(rewritten_question)
+                # 面试点：追问向量去污染
+                # follow_up 时主向量用 expanded（纯实体消解，如「张成都的项目」），
+                # 而非 context（「基于之前关于…的讨论」）——后者混入对话套话会
+                # 把语义空间拉向"讨论/上下文"这类词，降低对原文档的召回精度。
+                # context 仅用于 BM25（关键词检索对套话不敏感，反而能借上下文多命中实体）。
+                use_expanded_for_vector = (
+                    cfg.follow_up_vector_use_expanded
+                    and intent in ("follow_up", "clarify")
+                    and expanded_question != rewritten_question
+                )
+                vector_question = expanded_question if use_expanded_for_vector else rewritten_question
+                query_vector = self.embedding.encode_query(vector_question)
             except ModelLoadError:
                 self.logger.warn(trace_id, "rag_service",
                                  "Embedding加载失败，降级到 BM25 检索")
@@ -232,17 +264,20 @@ class RAGService:
             embed_time = (time.time() - embed_start) * 1000
             timing["embedding_ms"] = round(embed_time, 1)
 
-            # Step 2: ES 混合检索（主查询：context 版本）
+            # Step 2: ES 混合检索
             search_start = time.time()
             try:
+                # 主检索：向量用去污染的 vector_question；BM25 用 context（带对话上下文，多命中实体）
+                bm25_question = rewritten_question if use_expanded_for_vector else vector_question
                 candidates = self.es.search_hybrid(
-                    query_vector, query_text=rewritten_question,
+                    query_vector, query_text=bm25_question,
                     top_k=top_k * 2,
                     min_score=get_config().retrieval.min_score
                 )
 
-                # 若 expanded 与 context 不同，再做一次检索并融合
-                if expanded_question != rewritten_question:
+                # expanded 与 context 不同时，补一次 expanded 的 BM25 + 向量融合
+                # （多路召回：context 借上下文，expanded 借精确实体，RRF 融合取并集）
+                if expanded_question != rewritten_question and not use_expanded_for_vector:
                     vec2 = self.embedding.encode_query(expanded_question)
                     expanded_candidates = self.es.search_hybrid(
                         vec2, query_text=expanded_question,
@@ -263,8 +298,9 @@ class RAGService:
             timing["search_ms"] = round(search_time, 1)
 
             # Step 3: 可选重排
+            rerank_query = expanded_question if expanded_question != question else question
             if self.rerank and len(candidates) > top_k:
-                candidates = self.rerank.rerank(expanded_question, candidates, top_k=top_k)
+                candidates = self.rerank.rerank(rerank_query, candidates, top_k=top_k)
             else:
                 candidates = candidates[:top_k]
 
@@ -285,17 +321,26 @@ class RAGService:
                         timing["decomposed"] = True
                         timing["decomposed_count"] = len(decomposed)
 
-            # Step 5: 检索仍为空时的兜底 + 引导
+            # Step 5: 邻域上下文扩展（重排后、截断前，确保邻居进入上下文）
+            if candidates and get_config().retrieval.enable_neighbor_expansion:
+                window = get_config().retrieval.neighbor_window
+                candidates = self.es.expand_neighbors(candidates, window=window)
+                neighbor_count = sum(1 for c in candidates if c.get("score", 0) == 0.0
+                                     and not c.get("is_full_doc"))
+                if neighbor_count:
+                    timing["neighbor_expanded"] = neighbor_count
+
+            # Step 6: 检索仍为空时的兜底 + 引导
             if not candidates:
                 trace["error"] = "empty_retrieval"
                 return self._build_error_response(
                     trace_id, timing, trace,
                     "抱歉，知识库中未找到与您问题相关的信息。",
-                    suggestion="建议：1) 尝试用不同关键词提问；2) 上传包含相关内容的文档；3) 如果是人名/项目关系查询，可分别搜索每个实体。",
+                    suggestion=self._build_empty_retrieval_suggestion(),
                     empty_retrieval=True
                 )
 
-            # Step 6: 用户手动触发整篇文档召回
+            # Step 7: 用户手动触发整篇文档召回
             if retrieve_full_doc and get_config().retrieval.enable_full_document:
                 full_docs = self._retrieve_full_documents(
                     list({c["file_name"] for c in candidates})
@@ -303,7 +348,7 @@ class RAGService:
                 if full_docs:
                     candidates = full_docs
 
-            # Step 7: 来源复用加权（放在重排后，避免干扰重排）
+            # Step 8: 来源复用加权（放在重排后，避免干扰重排）
             trace["candidates_before_boost"] = len(candidates)
             candidates = self._boost_historical_sources(
                 candidates, history, boost=cfg.source_boost
@@ -320,10 +365,10 @@ class RAGService:
 
             candidates = candidates[:top_k]
 
-            # Step 8: 拼接上下文
+            # Step 9: 拼接上下文
             context = self._build_context(candidates)
 
-            # Step 9: 调用 LLM 生成
+            # Step 10: 调用 LLM 生成
             llm_start = time.time()
             try:
                 answer = self.llm.generate(
@@ -348,7 +393,7 @@ class RAGService:
             llm_time = time.time() - llm_start
             timing["llm_s"] = round(llm_time, 1)
 
-            # Step 10: 检测 LLM 请求的所有完整文档（去重保序，逐个召回）
+            # Step 11: 检测 LLM 请求的所有完整文档（去重保序，逐个召回）
             requested_files = self._need_full_documents(answer)
             if requested_files and not retrieve_full_doc and get_config().retrieval.enable_full_document:
                 self.logger.info(trace_id, "rag_service",
@@ -438,6 +483,24 @@ class RAGService:
             result["fallback_context"] = fallback_context
         return result
 
+    def _build_empty_retrieval_suggestion(self) -> str:
+        """
+        动态空检索建议：列出知识库中实际的文档名，帮用户「知道能问什么」。
+        面试点：静态建议（"换个问法"）信息量低，用户不知道库里有什么；
+            动态列出文档名，用户立刻能据此组织问题，体验提升明显。
+        """
+        base = "建议：1) 尝试用不同关键词提问；2) 上传包含相关内容的文档；3) 多实体/项目关系查询可分别搜索每个实体。"
+        try:
+            docs = self.es.list_file_names()
+            names = [d.get("file_name", "") for d in docs if d.get("file_name")]
+            if names:
+                shown = "、".join(names[:5])
+                more = f"等共 {len(names)} 份" if len(names) > 5 else ""
+                return f"当前知识库包含：{shown}{more}。\n{base}"
+        except Exception:
+            pass
+        return base
+
     def _merge_candidates(self, c1: List[Dict], c2: List[Dict]) -> List[Dict]:
         """合并两路候选结果，去重并按分数排序"""
         seen = {}
@@ -479,7 +542,9 @@ class RAGService:
 
         try:
             # 意图识别 + 查询重写 + 历史压缩
-            intent = self._classify_intent(question, history)
+            intent = self._classify_intent(question, history, llm_kwargs={
+                "api_key": api_key, "provider": provider, "model": model, "base_url": base_url
+            })
             rewritten = self._rewrite_query(question, intent, history)
             trace["intent"] = intent
             trace["expanded_question"] = rewritten.get("expanded", question)
@@ -500,7 +565,14 @@ class RAGService:
             # Step 1: 查询向量化（使用重写后的问题）
             embed_start = time.time()
             try:
-                query_vector = self.embedding.encode_query(rewritten_question)
+                # 追问向量去污染：见 query() 同名注释
+                use_expanded_for_vector = (
+                    cfg.follow_up_vector_use_expanded
+                    and intent in ("follow_up", "clarify")
+                    and expanded_question != rewritten_question
+                )
+                vector_question = expanded_question if use_expanded_for_vector else rewritten_question
+                query_vector = self.embedding.encode_query(vector_question)
             except ModelLoadError:
                 self.logger.warn(trace_id, "rag_service",
                                  "Embedding加载失败，流式查询终止")
@@ -509,17 +581,17 @@ class RAGService:
             embed_time = (time.time() - embed_start) * 1000
             timing["embedding_ms"] = round(embed_time, 1)
 
-            # Step 2: ES 混合检索（主查询：context 版本）
+            # Step 2: ES 混合检索
             search_start = time.time()
             try:
+                bm25_question = rewritten_question if use_expanded_for_vector else vector_question
                 candidates = self.es.search_hybrid(
-                    query_vector, query_text=rewritten_question,
+                    query_vector, query_text=bm25_question,
                     top_k=top_k * 2,
                     min_score=get_config().retrieval.min_score
                 )
 
-                # 若 expanded 与 context 不同，再做一次检索并融合
-                if expanded_question != rewritten_question:
+                if expanded_question != rewritten_question and not use_expanded_for_vector:
                     vec2 = self.embedding.encode_query(expanded_question)
                     expanded_candidates = self.es.search_hybrid(
                         vec2, query_text=expanded_question,
@@ -536,8 +608,9 @@ class RAGService:
             timing["search_ms"] = round(search_time, 1)
 
             # Step 3: 可选重排
+            rerank_query = expanded_question if expanded_question != question else question
             if self.rerank and len(candidates) > top_k:
-                candidates = self.rerank.rerank(expanded_question, candidates, top_k=top_k)
+                candidates = self.rerank.rerank(rerank_query, candidates, top_k=top_k)
             else:
                 candidates = candidates[:top_k]
 
@@ -555,19 +628,28 @@ class RAGService:
                         timing["decomposed"] = True
                         timing["decomposed_count"] = len(decomposed)
 
-            # Step 5: 空检索兜底 + 引导
+            # Step 5: 邻域上下文扩展
+            if candidates and get_config().retrieval.enable_neighbor_expansion:
+                window = get_config().retrieval.neighbor_window
+                candidates = self.es.expand_neighbors(candidates, window=window)
+                neighbor_count = sum(1 for c in candidates if c.get("score", 0) == 0.0
+                                     and not c.get("is_full_doc"))
+                if neighbor_count:
+                    timing["neighbor_expanded"] = neighbor_count
+
+            # Step 6: 空检索兜底 + 引导
             if not candidates:
                 trace["error"] = "empty_retrieval"
                 yield {
                     "type": "error",
                     "message": "知识库中未找到与您问题相关的信息",
-                    "suggestion": "建议：1) 尝试用不同关键词提问；2) 上传包含相关内容的文档；3) 如果是人名/项目关系查询，可分别搜索每个实体。",
+                    "suggestion": self._build_empty_retrieval_suggestion(),
                     "empty_retrieval": True,
                     "trace_id": trace_id
                 }
                 return
 
-            # Step 6: 用户手动触发整篇文档召回
+            # Step 7: 用户手动触发整篇文档召回
             if retrieve_full_doc and get_config().retrieval.enable_full_document:
                 full_docs = self._retrieve_full_documents(
                     list({c["file_name"] for c in candidates})
@@ -575,7 +657,7 @@ class RAGService:
                 if full_docs:
                     candidates = full_docs
 
-            # Step 7: 来源复用加权
+            # Step 8: 来源复用加权
             trace["candidates_before_boost"] = len(candidates)
             candidates = self._boost_historical_sources(
                 candidates, history, boost=cfg.source_boost
@@ -592,7 +674,7 @@ class RAGService:
 
             candidates = candidates[:top_k]
 
-            # Step 8: 拼接上下文
+            # Step 9: 拼接上下文
             context = self._build_context(candidates)
 
             # Step 9: 流式生成（同时过滤 retrieve_full_doc 标记，避免泄露给用户）
@@ -628,7 +710,7 @@ class RAGService:
             answer = self._strip_retrieve_marks(answer)
             answer_parts = [answer]  # 后续以清理后的内容继续
 
-            # Step 10: 检测 LLM 请求的所有完整文档（去重保序，逐个召回）
+            # Step 11: 检测 LLM 请求的所有完整文档（去重保序，逐个召回）
             requested_files = self._need_full_documents(answer)
             if requested_files and not retrieve_full_doc and get_config().retrieval.enable_full_document:
                 self.logger.info(trace_id, "rag_service",
@@ -749,16 +831,40 @@ class RAGService:
 
     def _build_context(self, candidates: List[Dict]) -> str:
         """
-        上下文拼接
+        上下文拼接 - 面试点：
+        - 邻域扩展块（score≈0 且非 full_doc）标注「上下文补充」，提示 LLM 这是相邻片段
+        - 同文件的邻域块紧跟主命中块后排序，便于 LLM 衔接理解跨块语义
         """
+        if not candidates:
+            return ""
+
+        # 排序：主命中（有分）优先，邻域块（零分）按 file_name + chunk_index 紧随其后
+        def sort_key(c):
+            fn = c.get("file_name", "")
+            ci = c.get("chunk_index", 0) or 0
+            is_neighbor = (c.get("score", 0) == 0.0 and not c.get("is_full_doc"))
+            # 主命中块在前（0），邻域块在后（1），同组内按 chunk_index
+            return (is_neighbor, fn, ci)
+
+        ordered = sorted(candidates, key=sort_key)
+
         context_parts = []
-        for i, c in enumerate(candidates, 1):
+        for i, c in enumerate(ordered, 1):
             score = c.get("rerank_score", c.get("score", 0))
-            label = "【完整文档】" if c.get("is_full_doc") else f"【来源{i}】"
+            is_neighbor = (c.get("score", 0) == 0.0 and not c.get("is_full_doc")
+                           and "rerank_score" not in c)
+            if c.get("is_full_doc"):
+                label = "【完整文档】"
+            elif is_neighbor:
+                label = f"【上下文补充{i}】"
+            else:
+                label = f"【来源{i}】"
             section = c.get("section_title", "")
             section_hint = f" (章节: {section})" if section else ""
+            ci = c.get("chunk_index", 0)
+            ci_hint = f" · 片段#{ci}" if ci is not None and not c.get("is_full_doc") else ""
             context_parts.append(
-                f"{label}{c['file_name']}{section_hint} (相关度: {score:.2f})\n"
+                f"{label}{c['file_name']}{section_hint}{ci_hint} (相关度: {score:.2f})\n"
                 f"内容: {c['content']}"
             )
         return "\n\n".join(context_parts)

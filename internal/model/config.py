@@ -44,6 +44,8 @@ class ChunkConfig(BaseModel):
     chunk_size: int = 400
     overlap: int = 50
     strategy: str = "fixed"  # fixed | semantic | hybrid
+    # CSV 分块时为每行注入表头，保持每行语义完整
+    csv_inject_header: bool = True
 
 
 class LLMConfig(BaseModel):
@@ -68,6 +70,9 @@ class RetrievalConfig(BaseModel):
     top_k: int = 5
     min_score: float = 0.0  # RRF 融合后分数 ≤ 0.033；阈值默认关闭，由 RRF 排名决定
     enable_full_document: bool = True
+    # 邻域上下文扩展：命中某 chunk 后，召回同文档相邻 chunk 拼接上下文
+    enable_neighbor_expansion: bool = True
+    neighbor_window: int = 1  # 前后各扩展 N 个 chunk
 
 
 class ConversationConfig(BaseModel):
@@ -81,6 +86,11 @@ class ConversationConfig(BaseModel):
     enable_intent_llm: bool = False
     intent_rule_confidence_threshold: float = 0.85
     intent_model: str = "gpt-4o-mini"
+    # 追问向量检索用 expanded（纯实体消解）而非 context（含对话噪音）
+    follow_up_vector_use_expanded: bool = True
+    # 查询向量缓存：相同问题文本复用向量，避免重复推理
+    enable_query_vector_cache: bool = True
+    query_vector_cache_size: int = 128
 
 
 class CorsConfig(BaseModel):

@@ -21,7 +21,8 @@ class ESService:
         self.index = self.repo.index
 
     def search_hybrid(self, query_vector: np.ndarray, query_text: str = "",
-                      top_k: int = 5, min_score: float = 0.0) -> List[Dict]:
+                      top_k: int = 5, min_score: float = 0.0,
+                      exclude_full_doc: bool = True) -> List[Dict]:
         """
         混合检索：向量相似度 + BM25 关键词，RRF 融合
         面试点：
@@ -30,15 +31,18 @@ class ESService:
 
         全链路：query → 向量检索 + BM25 → RRF融合 → 取TopK
         检索量：每路取 max(20, top_k*5)，确保向量与关键词命中都能进入候选。
+        exclude_full_doc：排除父文档，避免首段向量污染（详见 repo.search_by_vector）。
         """
         # Step 1: 向量检索
         vector_size = max(20, top_k * 5)
-        vector_results = self.repo.search_by_vector(query_vector, size=vector_size)
+        vector_results = self.repo.search_by_vector(
+            query_vector, size=vector_size, exclude_full_doc=exclude_full_doc)
 
         # Step 2: BM25 关键词检索
         keyword_results = []
         if query_text:
-            keyword_results = self.repo.search_by_keyword(query_text, size=vector_size)
+            keyword_results = self.repo.search_by_keyword(
+                query_text, size=vector_size, exclude_full_doc=exclude_full_doc)
 
         # Step 3: RRF 融合
         if not keyword_results:
@@ -66,6 +70,49 @@ class ESService:
         ES text 字段默认 BM25 算法
         """
         return self.repo.search_by_keyword(query_text, size=top_k)
+
+    def expand_neighbors(self, candidates: List[Dict], window: int = 1) -> List[Dict]:
+        """
+        邻域上下文扩展：对命中候选，按同 file_name + 相邻 chunk_index 召回上下文块。
+        面试点：
+        - 只对非父文档候选扩展（父文档已是全文）
+        - 同 file_name 分组，按 chunk_index 计算前后 window 个邻居
+        - 已命中块去重，邻居以 score=0 追加在末尾（不干扰重排分数）
+        返回：candidates + 邻域块（去重，邻域块在末尾）。
+        """
+        if not candidates or window <= 0:
+            return candidates
+
+        # 按 file_name 聚合命中 chunk_index
+        grouped: Dict[str, set] = {}
+        seen_ids = {c.get("chunk_id") for c in candidates if c.get("chunk_id")}
+        for c in candidates:
+            if c.get("is_full_doc"):
+                continue
+            fn = c.get("file_name")
+            ci = c.get("chunk_index")
+            if fn is None or ci is None:
+                continue
+            grouped.setdefault(fn, set()).add(ci)
+
+        neighbors: List[Dict] = []
+        for fn, indices in grouped.items():
+            target = set()
+            for ci in indices:
+                for w in range(1, window + 1):
+                    target.add(ci - w)
+                    target.add(ci + w)
+            # 排除已命中的 chunk_index，避免重复召回
+            target -= indices
+            if not target:
+                continue
+            found = self.repo.search_neighbor_chunks(fn, sorted(target))
+            for nb in found:
+                if nb.get("chunk_id") not in seen_ids:
+                    neighbors.append(nb)
+                    seen_ids.add(nb.get("chunk_id"))
+
+        return candidates + neighbors
 
     def _rrf_fusion(self, vector_results: List[Dict],
                     keyword_results: List[Dict],

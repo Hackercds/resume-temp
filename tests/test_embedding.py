@@ -50,14 +50,19 @@ class TestChunkService:
         assert len(chunks) == 0
 
     def test_chunk_csv(self):
-        """CSV 按行分块"""
+        """CSV 按行分块（表头注入：表头不再单独成块，注入到每行）"""
         from internal.service.chunk_service import ChunkService
         service = ChunkService()
         csv_content = "name,age,city\nAlice,25,Beijing\nBob,30,Shanghai"
         chunks = service.chunk_csv(csv_content, "test.csv")
-        assert len(chunks) == 3
+        # 2 行数据，表头注入到每行内容
+        assert len(chunks) == 2
         assert chunks[0]["chunk_id"] == "test.csv_row_0"
         assert chunks[1]["chunk_id"] == "test.csv_row_1"
+        # 表头应注入到内容里
+        assert "name: Alice" in chunks[0]["content"]
+        assert "city: Beijing" in chunks[0]["content"]
+        assert "name: Bob" in chunks[1]["content"]
 
     def test_chunk_csv_empty_lines(self):
         """CSV 空行应被跳过"""

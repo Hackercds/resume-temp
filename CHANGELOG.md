@@ -1,5 +1,51 @@
 # CHANGELOG
 
+## [1.2.0] - 2026-07-02
+
+### 检索召回质量升级（从技术栈原理底层优化）
+
+#### ES 中文分词
+- 索引映射升级为 `ik_max_word`（写入细粒度）+ `ik_smart`（查询智能切分）
+- 启动时探测 `analysis-ik` 插件，未安装自动降级 `standard` 并告警，保证「有 ik 用 ik，没 ik 不崩」
+- 旧索引动态补字段时同步使用 ik 分析器
+- 全文 `full_text` 字段同样启用 ik 分词
+
+#### 切片全量召回策略
+- **邻域上下文扩展（neighbor expansion）**：命中某 chunk 后，按同 `file_name` + 相邻 `chunk_index` 召回前后 N 个块（默认 N=1），拼成扩展上下文，解决跨块「如前所述」断章取义。一次 `terms` 查询完成，开销极低
+- **全文父文档防污染**：`is_full_doc=true` 的父文档不再参与向量/关键词常规检索（`exclude_full_doc` 过滤），避免首段向量误匹配挤占 top_k；父文档仅通过 `retrieve_full_document` 按 file_name 精确召回
+- **CSV 表头继承**：CSV 分块时把第 0 行表头注入每条数据行（`name: 张三 | skill: Python`），每行自包含完整语义；单列文本自动识别不误当表头；正确处理引号内逗号
+- context 拼接：邻域块标注「【上下文补充N】」并按文件+chunk_index 排序，便于 LLM 衔接理解
+
+#### 连续对话质量升级
+- **追问向量去污染**：`follow_up`/`clarify` 时主向量用 `expanded`（纯实体消解，如「张成都的项目」），而非 `context`（含「基于之前关于…」套话）——后者会把语义空间拉向「讨论/上下文」类词，降低对原文档的召回精度；`context` 仅用于 BM25（关键词检索对套话不敏感，反而能借上下文多命中实体）
+- **查询向量 LRU 缓存**：相同问题文本复用向量，避免重试/相似追问/多路检索重复推理（CPU ~50ms → 0ms），可配置容量与开关
+- **指代消解增强**：支持多代词/多次出现替换（「他的项目和他的经验」→ 两处「他」都替换），单实体全替换、多实体保守只替换句首；保护「其他」不被误替换
+- **历史压缩保留 assistant 答案**：旧版只留 user 问句导致长对话失忆；改为「问→答」配对压缩摘要，保留关键结论
+- **LLM 意图识别真实可用**：修复 `_llm_classify` 的 `NotImplementedError` 死代码，实现规则优先 + LLM 四分类兜底（JSON 输出 + 容错解析），api_key 透传
+
+#### 体验优化
+- **空检索动态建议**：空检索时返回知识库实际文档名（「当前知识库包含：简历.pdf、项目.md」），让用户「知道能问什么」，替代静态文本
+- **Prompt 质量优化**：强化引用规范（标注来源编号）、明确邻域片段衔接说明、防幻觉约束、列举条理化要求
+
+### Added
+- `config.yaml` 新增：`chunk.csv_inject_header`、`retrieval.enable_neighbor_expansion`、`retrieval.neighbor_window`、`conversation.follow_up_vector_use_expanded`、`conversation.enable_query_vector_cache`、`conversation.query_vector_cache_size`
+- `es_repository`：`_detect_ik_available`、`search_neighbor_chunks`、`search_by_vector(exclude_full_doc)`、`search_by_keyword(exclude_full_doc)`
+- `es_service`：`expand_neighbors`
+- `embedding_service`：查询向量 LRU 缓存（`encode_query` 缓存 + `clear_query_cache`）
+- `rag_service`：`_build_empty_retrieval_suggestion`、追问向量去污染编排、邻域扩展接入
+- `intent_service`：真实可用的 `_llm_classify`、`resolve_references` 多代词增强
+- `tests/test_retrieval_upgrade.py`：39 个专项单元测试覆盖全部升级点
+
+### Changed
+- `search_by_vector`/`search_by_keyword` 默认 `exclude_full_doc=True`
+- `create_index` 索引映射使用 ik 分词器（探测后降级）
+- `_build_context` 标注邻域块并按文件+chunk_index 排序
+- `_build_prompt` 强化引用与防幻觉约束
+- `_compress_history` 保留 assistant 答案摘要
+
+### Tests
+- 全量 84 个测试通过（原 45 + 新增 39），无回归
+
 ## [1.1.0] - 2026-06-28
 
 ### Added

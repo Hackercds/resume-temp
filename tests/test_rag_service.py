@@ -78,8 +78,10 @@ class TestRAGService:
         mock_es_instance = MagicMock()
         mock_es_instance.search_hybrid.return_value = [
             {"chunk_id": "c1", "content": "张成都熟悉Python开发",
-             "file_name": "resume.pdf", "score": 0.89}
+             "file_name": "resume.pdf", "chunk_index": 0, "score": 0.89}
         ]
+        # 邻域扩展：返回原候选（模拟无相邻块）
+        mock_es_instance.expand_neighbors.side_effect = lambda cands, **kw: cands
         mock_es.return_value = mock_es_instance
 
         # Mock LLM
@@ -278,8 +280,9 @@ class TestRetrieveFullDocMarks:
 
         mock_es_instance = MagicMock()
         mock_es_instance.search_hybrid.return_value = [
-            {"chunk_id": "c1", "content": "x", "file_name": "a.pdf", "score": 0.5}
+            {"chunk_id": "c1", "content": "x", "file_name": "a.pdf", "chunk_index": 0, "score": 0.5}
         ]
+        mock_es_instance.expand_neighbors.side_effect = lambda cands, **kw: cands
         # 全文召回返回完整文档
         mock_es_instance.retrieve_full_document.return_value = {
             "chunk_id": "a.pdf__full_doc", "content": "完整内容", "file_name": "a.pdf",

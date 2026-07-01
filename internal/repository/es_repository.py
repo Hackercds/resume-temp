@@ -59,25 +59,67 @@ class ESRepository:
             return False
 
     # ---------- 索引操作 ----------
+    # 中文分词器：优先 ik_max_word（细粒度，召回高），查询用 ik_smart（智能切分，精确）。
+    # ES 未安装 ik 插件时，mapping 仍可创建，但检索时若 analyzer 不存在会回退到 standard。
+    # 为保证健壮性，create_index 时探测 ik 是否可用，不可用则降级 standard 并记录日志。
+    _ZH_ANALYZER = "ik_max_word"
+    _ZH_SEARCH_ANALYZER = "ik_smart"
+
+    def _detect_ik_available(self, es) -> bool:
+        """
+        探测 ES 是否安装了 analysis-ik 插件。
+        面试点：为什么不硬依赖 ik？
+        答：开发/CI 环境常装的是精简版 ES，强制 ik 会让索引创建直接失败。
+            探测后降级，保证「有 ik 用 ik，没 ik 不崩」。
+        """
+        try:
+            # GET /_cat/plugins — 含 ik 说明已安装
+            plugins = es.cat.plugins(format="json")
+            for row in plugins or []:
+                if "analysis-ik" in (row.get("component", "") or "") or \
+                   "ik" in (row.get("name", "") or ""):
+                    return True
+            return False
+        except Exception as e:
+            self.logger.warn("es_repository", "_detect_ik_available",
+                             "IK 插件探测失败，降级 standard", error=str(e)[:120])
+            return False
+
     def create_index(self, index_name: str = None) -> Dict:
-        """创建带 dense_vector 映射的索引 - 面试点：ES 8.x dense_vector 配置"""
+        """
+        创建带 dense_vector 映射的索引 - 面试点：ES 8.x dense_vector 配置
+        中文分词：有 ik 插件用 ik_max_word/ik_smart，否则降级 standard。
+        全文父文档（is_full_doc=true）通过 filter 在常规检索中排除，避免首段向量污染 top_k。
+        """
         index = index_name or self.index
         es = self.connect()
+        use_ik = self._detect_ik_available(es)
+        analyzer = self._ZH_ANALYZER if use_ik else "standard"
+        search_analyzer = self._ZH_SEARCH_ANALYZER if use_ik else "standard"
+        if use_ik:
+            self.logger.info("create_index", "es_repository",
+                             "✓ 启用 IK 中文分词",
+                             analyzer=analyzer, search_analyzer=search_analyzer)
+        else:
+            self.logger.warn("create_index", "es_repository",
+                             "IK 插件未安装，使用 standard 分词（中文 BM25 召回较弱）",
+                             hint="安装 analysis-ik 以提升中文检索质量")
+
         mapping = {
             "mappings": {
                 "properties": {
                     "chunk_id": {"type": "keyword"},
                     "content": {
                         "type": "text",
-                        "analyzer": "standard",  # 生产环境推荐 ik_max_word
-                        "search_analyzer": "standard"
+                        "analyzer": analyzer,        # 有 ik 用 ik_max_word，否则 standard
+                        "search_analyzer": search_analyzer
                     },
                     "file_name": {"type": "keyword"},
                     "chunk_index": {"type": "integer"},
                     "char_count": {"type": "integer"},
                     "section_title": {"type": "keyword"},
                     "upload_time": {"type": "date"},
-                    "full_text": {"type": "text", "analyzer": "standard"},
+                    "full_text": {"type": "text", "analyzer": analyzer},
                     "is_full_doc": {"type": "boolean"},
                     "doc_id": {"type": "keyword"},
                     "vector": {
@@ -100,13 +142,17 @@ class ESRepository:
         """
         兼容旧索引：动态添加整篇文档召回及语义分块所需字段。
         ES 8.x 支持向已有 mapping 添加字段，不会丢失数据。
+        新增 text 字段时若 ES 支持 ik，使用 ik 分词器。
         """
         es = self.connect()
         try:
             mapping = es.indices.get_mapping(index=self.index)
             props = mapping.get(self.index, {}).get("mappings", {}).get("properties", {})
+            use_ik = self._detect_ik_available(es)
+            analyzer = self._ZH_ANALYZER if use_ik else "standard"
+            search_analyzer = self._ZH_SEARCH_ANALYZER if use_ik else "standard"
             missing = []
-            for field, ftype in [("full_text", {"type": "text", "analyzer": "standard"}),
+            for field, ftype in [("full_text", {"type": "text", "analyzer": analyzer}),
                                  ("is_full_doc", {"type": "boolean"}),
                                  ("doc_id", {"type": "keyword"}),
                                  ("section_title", {"type": "keyword"})]:
@@ -116,7 +162,8 @@ class ESRepository:
                 body = {"properties": {field: ftype for field, ftype in missing}}
                 es.indices.put_mapping(index=self.index, body=body)
                 self.logger.info("es_repository", "_ensure_full_doc_fields",
-                                 f"已动态添加字段: {[f for f, _ in missing]}")
+                                 f"已动态添加字段: {[f for f, _ in missing]}",
+                                 analyzer=analyzer)
         except Exception as e:
             self.logger.warn("es_repository", "_ensure_full_doc_fields",
                              "动态添加字段失败", error=str(e)[:200])
@@ -216,24 +263,35 @@ class ESRepository:
         }
 
     # ---------- 数据检索 ----------
-    def search_by_vector(self, query_vector: np.ndarray, size: int = 10) -> List[Dict]:
+    def search_by_vector(self, query_vector: np.ndarray, size: int = 10,
+                         exclude_full_doc: bool = True) -> List[Dict]:
         """
         向量语义检索 - 面试点：cosineSimilarity + 1.0 确保分数非负
         ES script_score 需要正分数做排序
+
+        exclude_full_doc：排除 is_full_doc=true 的父文档。
+        面试点：为什么要排除？
+        答：入库时父文档的 vector 只编码了「前 chunk_size 字」的向量，
+            它会以首段语义匹配、并挤占 top_k，污染检索结果。
+            父文档应只通过 retrieve_full_document 按 file_name 精确召回。
         """
         es = self.connect()
+        query_filter = []
+        if exclude_full_doc:
+            query_filter.append({"term": {"is_full_doc": False}})
+
         body = {
             "size": size,
             "query": {
                 "script_score": {
-                    "query": {"match_all": {}},
+                    "query": {"bool": {"filter": query_filter}} if query_filter else {"match_all": {}},
                     "script": {
                         "source": "cosineSimilarity(params.query_vector, 'vector') + 1.0",
                         "params": {"query_vector": query_vector.tolist()}
                     }
                 }
             },
-            "_source": ["chunk_id", "content", "file_name", "chunk_index", "section_title"]
+            "_source": ["chunk_id", "content", "file_name", "chunk_index", "section_title", "is_full_doc"]
         }
         response = es.search(index=self.index, body=body)
         return [
@@ -243,28 +301,29 @@ class ESRepository:
                 "file_name": hit["_source"]["file_name"],
                 "chunk_index": hit["_source"].get("chunk_index", 0),
                 "section_title": hit["_source"].get("section_title", ""),
+                "is_full_doc": hit["_source"].get("is_full_doc", False),
                 "score": hit["_score"] - 1.0  # 还原为真实余弦相似度
             }
             for hit in response["hits"]["hits"]
         ]
 
-    def search_by_keyword(self, query_text: str, size: int = 10) -> List[Dict]:
+    def search_by_keyword(self, query_text: str, size: int = 10,
+                          exclude_full_doc: bool = True) -> List[Dict]:
         """
         BM25 关键词检索 - 面试点：ES match query 默认使用 BM25 算法
         为什么保留这个？即使 embedding 不可用，基本搜索功能仍可用（降级方案）
+        exclude_full_doc：同 search_by_vector，排除父文档避免污染。
         """
         es = self.connect()
+        must = [{"match": {"content": {"query": query_text, "operator": "or"}}}]
+        bool_body = {"must": must}
+        if exclude_full_doc:
+            bool_body["filter"] = [{"term": {"is_full_doc": False}}]
+
         body = {
             "size": size,
-            "query": {
-                "match": {
-                    "content": {
-                        "query": query_text,
-                        "operator": "or"
-                    }
-                }
-            },
-            "_source": ["chunk_id", "content", "file_name", "chunk_index", "section_title"]
+            "query": {"bool": bool_body},
+            "_source": ["chunk_id", "content", "file_name", "chunk_index", "section_title", "is_full_doc"]
         }
         response = es.search(index=self.index, body=body)
         return [
@@ -274,10 +333,55 @@ class ESRepository:
                 "file_name": hit["_source"]["file_name"],
                 "chunk_index": hit["_source"].get("chunk_index", 0),
                 "section_title": hit["_source"].get("section_title", ""),
+                "is_full_doc": hit["_source"].get("is_full_doc", False),
                 "score": hit["_score"]
             }
             for hit in response["hits"]["hits"]
         ]
+
+    def search_neighbor_chunks(self, file_name: str, chunk_indices: List[int]) -> List[Dict]:
+        """
+        邻域上下文扩展：按 file_name + 一组 chunk_index 精确召回相邻 chunk。
+        面试点：为什么要做邻域扩展？
+        答：分块会切断跨块语义（「如前所述」「上文提到的项目」），
+            命中某块后召回其前后相邻块，能让 LLM 看到完整上下文，
+            显著降低跨块追问的断章取义。一次 mget/term 查询完成，开销极低。
+        """
+        if not file_name or not chunk_indices:
+            return []
+        es = self.connect()
+        # 用 terms 一次查回所有目标 chunk_index
+        body = {
+            "size": len(chunk_indices) * 2 + 4,
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"term": {"file_name": file_name}},
+                        {"terms": {"chunk_index": chunk_indices}},
+                        {"term": {"is_full_doc": False}}
+                    ]
+                }
+            },
+            "_source": ["chunk_id", "content", "file_name", "chunk_index", "section_title"],
+            "sort": [{"chunk_index": {"order": "asc"}}]
+        }
+        try:
+            response = es.search(index=self.index, body=body)
+            return [
+                {
+                    "chunk_id": hit["_source"]["chunk_id"],
+                    "content": hit["_source"]["content"],
+                    "file_name": hit["_source"]["file_name"],
+                    "chunk_index": hit["_source"].get("chunk_index", 0),
+                    "section_title": hit["_source"].get("section_title", ""),
+                    "score": 0.0  # 邻域扩展项不计分，仅作上下文补充
+                }
+                for hit in response["hits"]["hits"]
+            ]
+        except Exception as e:
+            self.logger.warn("search_neighbor", "es_repository",
+                             "邻域扩展查询失败", error=str(e)[:120])
+            return []
 
     # ---------- 数据管理 ----------
     def delete_by_file_name(self, file_name: str) -> int:

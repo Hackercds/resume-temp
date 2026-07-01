@@ -7,6 +7,7 @@
 """
 import time
 from typing import List, Optional, Dict
+from collections import OrderedDict
 import numpy as np
 
 from internal.model.config import get_config
@@ -32,7 +33,9 @@ class EmbeddingService:
         self.max_concurrent = max_concurrent or emb_cfg.max_concurrent
         self.model = None
         self.dim = 512  # BGE-small-zh-v1.5 实际输出 512 维（BGE-base 才是 1024）
-        self._cache: Dict[str, np.ndarray] = {}  # 文本→向量缓存
+        self._cache: Dict[str, np.ndarray] = {}  # 文本→向量缓存（入库用）
+        self._query_cache: "OrderedDict[str, np.ndarray]" = OrderedDict()  # 查询向量 LRU 缓存
+        self._query_cache_size: int = 128
         self._loaded = False
         self.logger = get_logger()
 
@@ -169,8 +172,36 @@ class EmbeddingService:
     def encode_query(self, query: str) -> np.ndarray:
         """
         查询向量化 - 面试点：查询和文档用同一个模型，保证向量空间一致
+        带 LRU 缓存：相同问题文本复用向量，避免重试/相似追问时重复推理。
+        面试点：为什么查询要单独缓存？
+        答：查询是高频且高度重复的——同一用户重试、相似追问、多路检索
+            会反复 encode 同一段文本；CPU 推理 ~50ms，缓存命中即 0ms。
         """
-        return self.encode([query])[0]
+        cfg = get_config()
+        conv_cfg = cfg.conversation
+        if not conv_cfg.enable_query_vector_cache:
+            return self.encode([query])[0]
+
+        # 规范化 key：去首尾空白，避免"张三？"和"张三？ "判为不同
+        key = query.strip()
+        if not key:
+            return self.encode([query])[0]
+
+        cache = self._query_cache
+        if key in cache:
+            cache.move_to_end(key)  # 命中即提升为最近使用
+            return cache[key]
+
+        vec = self.encode([key])[0]
+        cache[key] = vec
+        size = conv_cfg.query_vector_cache_size or self._query_cache_size
+        while len(cache) > size:
+            cache.popitem(last=False)  # 淘汰最久未用
+        return vec
+
+    def clear_query_cache(self):
+        """清空查询向量缓存"""
+        self._query_cache.clear()
 
     def encode_cached(self, texts: List[str]) -> np.ndarray:
         """
@@ -226,6 +257,7 @@ class EmbeddingService:
     def clear_cache(self):
         """清空向量缓存"""
         self._cache.clear()
+        self._query_cache.clear()
 
 
 # 全局单例

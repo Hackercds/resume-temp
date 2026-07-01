@@ -245,19 +245,89 @@ class ChunkService:
         CSV 按行分块 - 面试点：CSV 为什么按行分块而不是按字数？
         答：CSV 每行通常是一个独立的语义单元（一条记录），
            按行分块保持每行语义完整，检索时能精确匹配到具体行
+
+        表头继承（csv_inject_header）：
+        把第 0 行（表头）作为列名，注入到每条数据行内容前。
+        面试点：为什么注入表头？
+        答：数据行「张三,30,Python」脱离表头后语义不明，
+           向量检索时无法与「姓名/年龄/技能」类查询匹配。
+           注入后变成「姓名: 张三 | 年龄: 30 | 技能: Python」，
+           每行自包含完整语义，召回质量显著提升。
+        CSV 带引号字段、含逗号的处理交给 csv 模块，避免手写 split 出错。
         """
-        lines = content.strip().split('\n')
-        chunks = []
-        for chunk_index, line in enumerate(lines):
-            line = line.strip()
-            if not line:
+        import csv
+        import io
+        cfg = get_config()
+        inject_header = getattr(cfg.chunk, 'csv_inject_header', True)
+
+        lines = content.split('\n')
+        # 用 csv reader 解析，正确处理引号内的逗号
+        rows = []
+        for raw in lines:
+            raw = raw.rstrip('\r')
+            if not raw.strip():
                 continue
-            chunks.append({
-                "chunk_id": f"{file_name}_row_{chunk_index}",
-                "content": line,
+            try:
+                fields = next(csv.reader(io.StringIO(raw)))
+            except Exception:
+                fields = [raw]
+            rows.append(fields)
+
+        if not rows:
+            return []
+
+        # 启发式：若所有行都是单字段（无逗号/分隔），视为无表头的纯文本行，按行分块
+        # 面试点：避免把单列文本的第一行误当表头，丢失该行内容。
+        all_single_field = all(len(r) <= 1 for r in rows)
+        if all_single_field:
+            chunks = []
+            for idx, fields in enumerate(rows):
+                content_text = fields[0].strip() if fields else ""
+                if not content_text:
+                    continue
+                chunks.append({
+                    "chunk_id": f"{file_name}_row_{idx}",
+                    "content": content_text,
+                    "file_name": file_name,
+                    "chunk_index": idx,
+                    "char_count": len(content_text)
+                })
+            return chunks
+
+        # 第一行作为表头
+        header = rows[0]
+        data_rows = rows[1:] if len(rows) > 1 else []
+        # 若只有表头没有数据行，把表头本身作为一个 chunk
+        if not data_rows:
+            content_text = " | ".join(str(h).strip() for h in header if str(h).strip())
+            return [{
+                "chunk_id": f"{file_name}_row_0",
+                "content": content_text,
                 "file_name": file_name,
-                "chunk_index": chunk_index,
-                "char_count": len(line)
+                "chunk_index": 0,
+                "char_count": len(content_text)
+            }]
+
+        chunks = []
+        for idx, fields in enumerate(data_rows):
+            if inject_header and len(header) >= len(fields):
+                # 表头:值 配对，跳过空值
+                pairs = []
+                for h, v in zip(header, fields):
+                    h = str(h).strip()
+                    v = str(v).strip()
+                    if h and v:
+                        pairs.append(f"{h}: {v}")
+                chunk_content = " | ".join(pairs) if pairs else " | ".join(str(f) for f in fields)
+            else:
+                chunk_content = " | ".join(str(f).strip() for f in fields if str(f).strip())
+
+            chunks.append({
+                "chunk_id": f"{file_name}_row_{idx}",
+                "content": chunk_content,
+                "file_name": file_name,
+                "chunk_index": idx,
+                "char_count": len(chunk_content)
             })
         return chunks
 
