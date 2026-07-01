@@ -297,12 +297,17 @@ class RAGService:
             search_time = (time.time() - search_start) * 1000
             timing["search_ms"] = round(search_time, 1)
 
-            # Step 3: 可选重排
+            # summarize 意图扩大最终返回数量（影响 diversity 目标）
+            if intent == "summarize":
+                top_k = max(top_k, 10)
+
+            # Step 3: 可选重排 —— 保留 top_k*3 候选供多样性选择，不一刀切到 top_k
             rerank_query = expanded_question if expanded_question != question else question
+            rerank_keep = max(top_k * 3, top_k + 5)
             if self.rerank and len(candidates) > top_k:
-                candidates = self.rerank.rerank(rerank_query, candidates, top_k=top_k)
+                candidates = self.rerank.rerank(rerank_query, candidates, top_k=rerank_keep)
             else:
-                candidates = candidates[:top_k]
+                candidates = self._sort_candidates_by_score(candidates)[:rerank_keep]
 
             # Step 4: 空检索 / 低质量结果 → 尝试多实体分解检索
             if not candidates or len(candidates) < 3:
@@ -321,17 +326,18 @@ class RAGService:
                         timing["decomposed"] = True
                         timing["decomposed_count"] = len(decomposed)
 
-            # Step 5: 邻域上下文扩展（重排后、截断前，确保邻居进入上下文）
-            if candidates and get_config().retrieval.enable_neighbor_expansion:
-                window = get_config().retrieval.neighbor_window
-                candidates = self.es.expand_neighbors(candidates, window=window)
-                neighbor_count = sum(1 for c in candidates if c.get("score", 0) == 0.0
-                                     and not c.get("is_full_doc"))
-                if neighbor_count:
-                    timing["neighbor_expanded"] = neighbor_count
+            # Step 5: 文档多样性选择 → primary（回答「其他文档为什么不能一次引用」）
+            # 单文档 cap + MMR 贪心，确保 top_k 覆盖多文档
+            if get_config().retrieval.enable_doc_diversity:
+                primary = self._diversify_by_document(
+                    candidates, top_k, get_config().retrieval.max_chunks_per_doc)
+            else:
+                primary = self._sort_candidates_by_score(candidates)[:top_k]
+            trace["primary_count"] = len(primary)
+            trace["primary_docs"] = list({c.get("file_name") for c in primary if c.get("file_name")})
 
             # Step 6: 检索仍为空时的兜底 + 引导
-            if not candidates:
+            if not primary:
                 trace["error"] = "empty_retrieval"
                 return self._build_error_response(
                     trace_id, timing, trace,
@@ -340,35 +346,48 @@ class RAGService:
                     empty_retrieval=True
                 )
 
-            # Step 7: 用户手动触发整篇文档召回
-            if retrieve_full_doc and get_config().retrieval.enable_full_document:
-                full_docs = self._retrieve_full_documents(
-                    list({c["file_name"] for c in candidates})
-                )
-                if full_docs:
-                    candidates = full_docs
-
-            # Step 8: 来源复用加权（放在重排后，避免干扰重排）
-            trace["candidates_before_boost"] = len(candidates)
-            candidates = self._boost_historical_sources(
-                candidates, history, boost=cfg.source_boost
+            # Step 7: 来源复用加权（在 primary 上，避免邻居分数干扰）
+            trace["candidates_before_boost"] = len(primary)
+            primary = self._boost_historical_sources(
+                primary, history, boost=cfg.source_boost
             )
-            trace["candidates_after_boost"] = len(candidates)
+            trace["candidates_after_boost"] = len(primary)
             trace["source_boosts"] = {
                 c.get("file_name"): c.get("source_boost", 0)
-                for c in candidates if c.get("source_boost")
+                for c in primary if c.get("source_boost")
             }
+            primary = primary[:top_k]
 
-            # summarize 意图扩大最终返回数量
-            if intent == "summarize":
-                top_k = max(top_k, 10)
+            # Step 8: 用户手动触发整篇文档召回（替换 primary 为完整文档）
+            if retrieve_full_doc and get_config().retrieval.enable_full_document:
+                full_docs = self._retrieve_full_documents(
+                    list({c["file_name"] for c in primary})
+                )
+                if full_docs:
+                    primary = full_docs
 
-            candidates = candidates[:top_k]
+            # Step 9: 邻域上下文扩展 → context_candidates（primary + 邻居）
+            # 回答「同一文档该用多少内容」：primary 命中 + 相邻块补充，不切 top_k，邻居进入上下文
+            context_candidates = list(primary)
+            neighbor_count = 0
+            if primary and get_config().retrieval.enable_neighbor_expansion:
+                # 全文召回模式下不再扩展邻居（已是完整文档）
+                is_full_doc_mode = retrieve_full_doc and any(c.get("is_full_doc") for c in primary)
+                if not is_full_doc_mode:
+                    window = get_config().retrieval.neighbor_window
+                    expanded = self.es.expand_neighbors(primary, window=window)
+                    primary_ids = {c.get("chunk_id") for c in primary}
+                    neighbors = [c for c in expanded
+                                 if c.get("chunk_id") not in primary_ids]
+                    if neighbors:
+                        context_candidates = primary + neighbors
+                        neighbor_count = len(neighbors)
+                        timing["neighbor_expanded"] = neighbor_count
 
-            # Step 9: 拼接上下文
-            context = self._build_context(candidates)
+            # Step 10: 拼接上下文（带文档预算，回答「该用多少内容」）
+            context = self._build_context(context_candidates)
 
-            # Step 10: 调用 LLM 生成
+            # Step 11: 调用 LLM 生成
             llm_start = time.time()
             try:
                 answer = self.llm.generate(
@@ -412,7 +431,8 @@ class RAGService:
                             history=compressed_history,
                             allow_full_doc_retrieval=False
                         )
-                        candidates = full_docs
+                        primary = full_docs
+                        context_candidates = full_docs
                         timing["full_doc_retrieval"] = True
                         trace["full_doc_requested"] = True
                         trace["full_doc_files"] = requested_files
@@ -423,9 +443,9 @@ class RAGService:
             # 清理答案中可能残留的 retrieve_full_doc 标记（防泄露给用户）
             answer = self._strip_retrieve_marks(answer)
 
-            # 构造返回
+            # 构造返回（sources 用 primary 多样化命中；context 已含邻居）
             return self._build_success_response(
-                question, answer, candidates, trace_id, timing, trace
+                question, answer, primary, trace_id, timing, trace
             )
 
         except Exception as e:
@@ -513,6 +533,65 @@ class RAGService:
             else:
                 seen[cid] = dict(c)
         return sorted(seen.values(), key=lambda x: x.get("score", 0), reverse=True)
+
+    def _diversify_by_document(self, candidates: List[Dict],
+                               top_k: int, max_per_doc: int = 2) -> List[Dict]:
+        """
+        文档多样性选择（MMR 简化版）—— 回答「其他文档为什么不能一次引用」。
+        确保 primary 命中覆盖多个文档，单一文档不超过 max_per_doc 个 chunk，
+        避免一份文档（如某份简历）的多个片段垄断 top_k、挤掉其他文档。
+
+        策略（贪心 MMR）：
+        1. 候选先按分数降序（重排分数优先，否则 RRF 分数）
+        2. 贪心选入：每文档计数，达 max_per_doc 则跳过该文档后续块，留位置给其他文档
+        3. 第一轮若不足 top_k（候选文档太少），回退忽略 cap 补齐，保证信息量
+
+        面试点：为什么不直接用纯 MMR（相似度惩罚）？
+        答：纯 MMR 需要 chunk 间相似度矩阵，计算开销随候选数平方增长；
+            per-doc cap 是 O(n) 的简化版，效果近似且对海量数据友好。
+            文档级多样性比 chunk 级去重更符合 RAG「多来源佐证」的诉求。
+
+        海量文章可扩展性：本策略 O(n)，与候选规模线性，百倍数据量也无需改算法；
+            若需更强去重，可叠加 chunk 级 MMR（仅对同一文档内的 chunk 做相似度去重）。
+        """
+        if not candidates:
+            return []
+        if max_per_doc <= 0 or len(candidates) <= top_k:
+            # 候选不多于 top_k，无需多样性裁剪，直接按分数取
+            return self._sort_candidates_by_score(candidates)[:top_k]
+
+        # 1. 按分数降序（rerank_score 优先，回退 score）
+        ranked = self._sort_candidates_by_score(candidates)
+
+        # 2. 第一轮：贪心选入，受 max_per_doc 约束
+        selected: List[Dict] = []
+        doc_count: Dict[str, int] = {}
+        for c in ranked:
+            if len(selected) >= top_k:
+                break
+            fn = c.get("file_name", "")
+            if doc_count.get(fn, 0) >= max_per_doc:
+                continue
+            selected.append(c)
+            doc_count[fn] = doc_count.get(fn, 0) + 1
+
+        # 3. 不足 top_k 时回退：忽略 cap 补齐（保证信息量，宁可单文档多取）
+        if len(selected) < top_k:
+            sel_ids = {id(c) for c in selected}
+            for c in ranked:
+                if len(selected) >= top_k:
+                    break
+                if id(c) in sel_ids:
+                    continue
+                selected.append(c)
+
+        return selected
+
+    @staticmethod
+    def _sort_candidates_by_score(candidates: List[Dict]) -> List[Dict]:
+        """按分数降序排序：优先 rerank_score，回退 score"""
+        return sorted(candidates, key=lambda c: c.get("rerank_score", c.get("score", 0)),
+                      reverse=True)
 
     async def query_stream(self, question: str, api_key: str,
                            provider: str = "openai", model: str = None,
@@ -607,12 +686,17 @@ class RAGService:
             search_time = (time.time() - search_start) * 1000
             timing["search_ms"] = round(search_time, 1)
 
-            # Step 3: 可选重排
+            # summarize 意图扩大最终返回数量（影响 diversity 目标）
+            if intent == "summarize":
+                top_k = max(top_k, 10)
+
+            # Step 3: 可选重排 —— 保留 top_k*3 候选供多样性选择
             rerank_query = expanded_question if expanded_question != question else question
+            rerank_keep = max(top_k * 3, top_k + 5)
             if self.rerank and len(candidates) > top_k:
-                candidates = self.rerank.rerank(rerank_query, candidates, top_k=top_k)
+                candidates = self.rerank.rerank(rerank_query, candidates, top_k=rerank_keep)
             else:
-                candidates = candidates[:top_k]
+                candidates = self._sort_candidates_by_score(candidates)[:rerank_keep]
 
             # Step 4: 多实体分解检索
             if not candidates or len(candidates) < 3:
@@ -628,17 +712,17 @@ class RAGService:
                         timing["decomposed"] = True
                         timing["decomposed_count"] = len(decomposed)
 
-            # Step 5: 邻域上下文扩展
-            if candidates and get_config().retrieval.enable_neighbor_expansion:
-                window = get_config().retrieval.neighbor_window
-                candidates = self.es.expand_neighbors(candidates, window=window)
-                neighbor_count = sum(1 for c in candidates if c.get("score", 0) == 0.0
-                                     and not c.get("is_full_doc"))
-                if neighbor_count:
-                    timing["neighbor_expanded"] = neighbor_count
+            # Step 5: 文档多样性选择 → primary
+            if get_config().retrieval.enable_doc_diversity:
+                primary = self._diversify_by_document(
+                    candidates, top_k, get_config().retrieval.max_chunks_per_doc)
+            else:
+                primary = self._sort_candidates_by_score(candidates)[:top_k]
+            trace["primary_count"] = len(primary)
+            trace["primary_docs"] = list({c.get("file_name") for c in primary if c.get("file_name")})
 
             # Step 6: 空检索兜底 + 引导
-            if not candidates:
+            if not primary:
                 trace["error"] = "empty_retrieval"
                 yield {
                     "type": "error",
@@ -649,35 +733,44 @@ class RAGService:
                 }
                 return
 
-            # Step 7: 用户手动触发整篇文档召回
-            if retrieve_full_doc and get_config().retrieval.enable_full_document:
-                full_docs = self._retrieve_full_documents(
-                    list({c["file_name"] for c in candidates})
-                )
-                if full_docs:
-                    candidates = full_docs
-
-            # Step 8: 来源复用加权
-            trace["candidates_before_boost"] = len(candidates)
-            candidates = self._boost_historical_sources(
-                candidates, history, boost=cfg.source_boost
+            # Step 7: 来源复用加权（在 primary 上）
+            trace["candidates_before_boost"] = len(primary)
+            primary = self._boost_historical_sources(
+                primary, history, boost=cfg.source_boost
             )
-            trace["candidates_after_boost"] = len(candidates)
+            trace["candidates_after_boost"] = len(primary)
             trace["source_boosts"] = {
                 c.get("file_name"): c.get("source_boost", 0)
-                for c in candidates if c.get("source_boost")
+                for c in primary if c.get("source_boost")
             }
+            primary = primary[:top_k]
 
-            # summarize 意图扩大最终返回数量
-            if intent == "summarize":
-                top_k = max(top_k, 10)
+            # Step 8: 用户手动触发整篇文档召回
+            if retrieve_full_doc and get_config().retrieval.enable_full_document:
+                full_docs = self._retrieve_full_documents(
+                    list({c["file_name"] for c in primary})
+                )
+                if full_docs:
+                    primary = full_docs
 
-            candidates = candidates[:top_k]
+            # Step 9: 邻域上下文扩展 → context_candidates
+            context_candidates = list(primary)
+            if primary and get_config().retrieval.enable_neighbor_expansion:
+                is_full_doc_mode = retrieve_full_doc and any(c.get("is_full_doc") for c in primary)
+                if not is_full_doc_mode:
+                    window = get_config().retrieval.neighbor_window
+                    expanded = self.es.expand_neighbors(primary, window=window)
+                    primary_ids = {c.get("chunk_id") for c in primary}
+                    neighbors = [c for c in expanded
+                                 if c.get("chunk_id") not in primary_ids]
+                    if neighbors:
+                        context_candidates = primary + neighbors
+                        timing["neighbor_expanded"] = len(neighbors)
 
-            # Step 9: 拼接上下文
-            context = self._build_context(candidates)
+            # Step 10: 拼接上下文（带文档预算）
+            context = self._build_context(context_candidates)
 
-            # Step 9: 流式生成（同时过滤 retrieve_full_doc 标记，避免泄露给用户）
+            # Step 11: 流式生成（同时过滤 retrieve_full_doc 标记，避免泄露给用户）
             llm_start = time.time()
             answer_parts = []
             try:
@@ -739,7 +832,8 @@ class RAGService:
                                 yield {"type": "token", "content": cleaned_token}
                         answer = "".join(answer_parts)
                         answer = self._strip_retrieve_marks(answer)
-                        candidates = full_docs
+                        primary = full_docs
+                        context_candidates = full_docs
                         timing["full_doc_retrieval"] = True
                         trace["full_doc_requested"] = True
                         trace["full_doc_files"] = requested_files
@@ -760,7 +854,7 @@ class RAGService:
                         "chunk_index": c.get("chunk_index", 0),
                         "is_full_doc": c.get("is_full_doc", False),
                     }
-                    for c in candidates
+                    for c in primary
                 ],
                 "trace_id": trace_id,
                 "timing": timing,
@@ -834,40 +928,87 @@ class RAGService:
         上下文拼接 - 面试点：
         - 邻域扩展块（score≈0 且非 full_doc）标注「上下文补充」，提示 LLM 这是相邻片段
         - 同文件的邻域块紧跟主命中块后排序，便于 LLM 衔接理解跨块语义
+        - 内容预算（context_char_budget）：按文档分配字符额度，单文档不垄断上下文窗口
+          回答「同一文档多次出现该用多少内容」——每文档给到额度上限，超出截断并提示
         """
         if not candidates:
             return ""
 
+        budget = max(1000, get_config().retrieval.context_char_budget)
         # 排序：主命中（有分）优先，邻域块（零分）按 file_name + chunk_index 紧随其后
         def sort_key(c):
             fn = c.get("file_name", "")
             ci = c.get("chunk_index", 0) or 0
             is_neighbor = (c.get("score", 0) == 0.0 and not c.get("is_full_doc"))
-            # 主命中块在前（0），邻域块在后（1），同组内按 chunk_index
             return (is_neighbor, fn, ci)
 
         ordered = sorted(candidates, key=sort_key)
 
+        # 按文档聚合，分配预算：primary 文档数 + 每文档额度
+        doc_names = []
+        for c in ordered:
+            fn = c.get("file_name", "")
+            if fn and fn not in doc_names:
+                doc_names.append(fn)
+        per_doc_budget = budget // max(1, len(doc_names))
+
         context_parts = []
-        for i, c in enumerate(ordered, 1):
+        doc_used: Dict[str, int] = {}
+        global_used = 0
+        src_idx = 0
+        nbr_idx = 0
+        truncated_docs: List[str] = []
+
+        for c in ordered:
+            fn = c.get("file_name", "")
+            content = c.get("content", "") or ""
             score = c.get("rerank_score", c.get("score", 0))
             is_neighbor = (c.get("score", 0) == 0.0 and not c.get("is_full_doc")
                            and "rerank_score" not in c)
             if c.get("is_full_doc"):
                 label = "【完整文档】"
+                idx = ""
             elif is_neighbor:
-                label = f"【上下文补充{i}】"
+                nbr_idx += 1
+                label = f"【上下文补充{nbr_idx}】"
+                idx = ""
             else:
-                label = f"【来源{i}】"
+                src_idx += 1
+                label = f"【来源{src_idx}】"
+                idx = ""
             section = c.get("section_title", "")
             section_hint = f" (章节: {section})" if section else ""
             ci = c.get("chunk_index", 0)
             ci_hint = f" · 片段#{ci}" if ci is not None and not c.get("is_full_doc") else ""
-            context_parts.append(
-                f"{label}{c['file_name']}{section_hint}{ci_hint} (相关度: {score:.2f})\n"
-                f"内容: {c['content']}"
-            )
-        return "\n\n".join(context_parts)
+            header = f"{label}{fn}{section_hint}{ci_hint} (相关度: {score:.2f})\n内容: "
+
+            # 完整文档不参与 per-doc 截断（用户主动召回全文）
+            if c.get("is_full_doc"):
+                context_parts.append(header + content)
+                global_used += len(content)
+                continue
+
+            # 按文档预算截断
+            used = doc_used.get(fn, 0)
+            remaining_doc = per_doc_budget - used
+            if remaining_doc <= 0:
+                if fn not in truncated_docs:
+                    truncated_docs.append(fn)
+                continue
+            # 头部开销 + 内容
+            piece = content[:remaining_doc]
+            if len(content) > remaining_doc:
+                piece = piece + "…[内容已按文档预算截断]"
+                if fn not in truncated_docs:
+                    truncated_docs.append(fn)
+            context_parts.append(header + piece)
+            doc_used[fn] = used + len(piece) + len(header)
+            global_used += len(piece) + len(header)
+
+        result = "\n\n".join(context_parts)
+        if truncated_docs:
+            result += f"\n\n[注：以下文档内容超出预算已截断：{', '.join(truncated_docs)}]"
+        return result
 
     def _need_full_document(self, answer: str) -> Optional[str]:
         """检测 LLM 是否请求查看完整文档（取第一个匹配）"""

@@ -69,6 +69,9 @@ retrieval:
   enable_full_document: true
   enable_neighbor_expansion: true   # 命中 chunk 后召回同文档相邻块拼接上下文
   neighbor_window: 1                  # 前后各扩展 N 个 chunk
+  enable_doc_diversity: true          # 文档多样性：top_k 覆盖多文档，避免单文档垄断
+  max_chunks_per_doc: 2               # 单文档在 primary 命中里的最大 chunk 数
+  context_char_budget: 6000           # 上下文字符预算，保护模型窗口，按文档分配
 
 conversation:
   max_history: 5

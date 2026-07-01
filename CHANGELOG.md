@@ -1,5 +1,40 @@
 # CHANGELOG
 
+## [1.3.0] - 2026-07-02
+
+### 文档多样性策略升级（回答「同一文档该用多少内容 / 其他文档为何不能一次引用」）
+
+#### 问题诊断
+- 旧流程在重排后 `candidates[:top_k]` 一刀切，单文档多个 chunk 会垄断 top_k，挤掉其他文档
+- 邻域扩展后追加的邻居会被最终 `[:top_k]` 切掉，**邻居其实没真正进入上下文**（v1.2 潜在 bug）
+- 同一文档多次出现时，给多少内容无控制，可能撑爆模型上下文窗口
+
+#### 策略升级
+- **文档多样性选择（MMR 简化版）** `_diversify_by_document`：贪心按分数选入，每文档不超过 `max_chunks_per_doc`（默认2），留位置给其他文档；候选不足时回退补齐。O(n) 复杂度，海量数据无需改算法
+- **primary / context 分离**：primary 是多样化命中（作为 `sources` 返回），context_candidates = primary + 邻居（用于拼上下文）。修复邻居被切掉的 bug，邻居真正进入上下文，但 sources 干净不混杂 score=0 的邻居
+- **上下文内容预算** `context_char_budget`（默认6000字符）：按文档均分额度，单文档超额度截断并提示「内容已按文档预算截断」；完整文档（用户手动召回）不参与截断。回答「该用多少内容」
+- 重排保留 `top_k*3` 候选供多样性选择，不一刀切到 top_k
+
+#### 海量文章可扩展性
+当前策略 O(n) 与候选规模线性，百倍数据量也无需改算法。后续可叠加：
+- 两阶段检索：先按 file_name 聚合召回 Top 文档，再在文档内取 Top chunk（候选数爆炸时启用）
+- chunk 级 MMR：仅对同文档内 chunk 做相似度去重（进一步降冗余）
+- ES 层：HNSW 已启用（dense_vector index=true）；可调 number_of_shards 横向扩展
+
+### Added
+- `config.yaml`：`retrieval.enable_doc_diversity`、`retrieval.max_chunks_per_doc`、`retrieval.context_char_budget`
+- `rag_service._diversify_by_document`、`_sort_candidates_by_score`
+- `_build_context` 文档预算截断逻辑
+- `QueryTrace` 增加 `primary_count`、`primary_docs` 字段
+- 12 个专项测试：多样性选择、per-doc cap、内容预算、邻居进上下文回归、端到端多文档
+
+### Fixed
+- 邻域扩展后被 `[:top_k]` 切掉、邻居无法进入上下文的潜在 bug（primary/context 分离后修复）
+- 单文档垄断 top_k、其他文档无法一次引用的问题
+
+### Tests
+- 全量 97 个测试通过（原 85 + 新增 12），无回归
+
 ## [1.2.1] - 2026-07-02
 
 ### Fixed

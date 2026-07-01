@@ -88,6 +88,9 @@ class QueryTrace(BaseModel):
     candidates_before_boost: int = 0
     candidates_after_boost: int = 0
     source_boosts: Dict[str, float] = Field(default_factory=dict)
+    # 文档多样性结果（v1.3）：primary 命中数、覆盖的文档列表
+    primary_count: int = 0
+    primary_docs: List[str] = Field(default_factory=list)
     full_doc_requested: bool = False
     error: Optional[str] = None
 

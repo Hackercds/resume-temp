@@ -703,3 +703,287 @@ class TestContextNeighborLabeling:
         from internal.service.rag_service import RAGService
         rag = RAGService.__new__(RAGService)
         assert rag._build_context([]) == ""
+
+
+# ==================== 文档多样性选择 ====================
+class TestDocumentDiversity:
+    """文档多样性：per-doc cap + MMR 多文档覆盖"""
+
+    def _make(self, file_name, idx, score):
+        return {"chunk_id": f"{file_name}_{idx}", "content": f"c{idx}",
+                "file_name": file_name, "chunk_index": idx, "score": score}
+
+    def test_caps_per_document(self):
+        """5 个候选全来自同一文档，max_per_doc=2 → 第一轮取2，回退补齐到 top_k"""
+        from internal.service.rag_service import RAGService
+        rag = RAGService.__new__(RAGService)
+        candidates = [
+            self._make("a.pdf", 0, 0.9),
+            self._make("a.pdf", 1, 0.8),
+            self._make("a.pdf", 2, 0.7),
+            self._make("a.pdf", 3, 0.6),
+            self._make("a.pdf", 4, 0.5),
+        ]
+        primary = rag._diversify_by_document(candidates, top_k=3, max_per_doc=2)
+        assert len(primary) == 3  # 回退补齐到 top_k
+        # 第一轮取了前 2（最高分），回退补第 3
+        assert primary[0]["chunk_id"] == "a.pdf_0"
+        assert primary[1]["chunk_id"] == "a.pdf_1"
+
+    def test_multi_doc_coverage(self):
+        """候选来自多个文档，确保每个文档都进入 primary（回答「其他文档一次引用」）"""
+        from internal.service.rag_service import RAGService
+        rag = RAGService.__new__(RAGService)
+        # 3 个文档各有 2 个 chunk
+        candidates = [
+            self._make("a.pdf", 0, 0.95),
+            self._make("a.pdf", 1, 0.90),
+            self._make("b.pdf", 0, 0.85),
+            self._make("b.pdf", 1, 0.80),
+            self._make("c.pdf", 0, 0.75),
+            self._make("c.pdf", 1, 0.70),
+        ]
+        primary = rag._diversify_by_document(candidates, top_k=3, max_per_doc=1)
+        # top_k=3, max_per_doc=1 → 3 个不同文档各取 1
+        docs = {c["file_name"] for c in primary}
+        assert docs == {"a.pdf", "b.pdf", "c.pdf"}
+        # 取的是各文档最高分
+        assert primary[0]["chunk_id"] == "a.pdf_0"
+
+    def test_max_per_doc_2_with_multiple_docs(self):
+        """多文档 + max_per_doc=2：优先铺开文档，每文档至多2"""
+        from internal.service.rag_service import RAGService
+        rag = RAGService.__new__(RAGService)
+        candidates = [
+            self._make("a.pdf", 0, 0.95), self._make("a.pdf", 1, 0.90),
+            self._make("a.pdf", 2, 0.85),
+            self._make("b.pdf", 0, 0.80), self._make("b.pdf", 1, 0.75),
+            self._make("c.pdf", 0, 0.70),
+        ]
+        primary = rag._diversify_by_document(candidates, top_k=4, max_per_doc=2)
+        assert len(primary) == 4
+        from collections import Counter
+        doc_counts = Counter(c["file_name"] for c in primary)
+        # a 最多2，b 最多2，c 至少1
+        assert doc_counts["a.pdf"] <= 2
+        assert doc_counts["b.pdf"] <= 2
+
+    def test_fallback_fills_when_docs_few(self):
+        """候选文档数 < top_k：回退忽略 cap 补齐，保证信息量"""
+        from internal.service.rag_service import RAGService
+        rag = RAGService.__new__(RAGService)
+        candidates = [
+            self._make("a.pdf", 0, 0.9),
+            self._make("a.pdf", 1, 0.8),
+            self._make("a.pdf", 2, 0.7),
+        ]
+        # top_k=5 但只有 3 个候选，max_per_doc=2 → 第一轮取2，回退补1，共3
+        primary = rag._diversify_by_document(candidates, top_k=5, max_per_doc=2)
+        assert len(primary) == 3  # 不超过候选总数
+
+    def test_empty_candidates(self):
+        from internal.service.rag_service import RAGService
+        rag = RAGService.__new__(RAGService)
+        assert rag._diversify_by_document([], top_k=5, max_per_doc=2) == []
+
+    def test_max_per_doc_zero_no_cap(self):
+        """max_per_doc=0 → 不裁剪，按分数取 top_k"""
+        from internal.service.rag_service import RAGService
+        rag = RAGService.__new__(RAGService)
+        candidates = [self._make("a.pdf", i, 0.9 - i * 0.1) for i in range(5)]
+        primary = rag._diversify_by_document(candidates, top_k=3, max_per_doc=0)
+        assert len(primary) == 3
+        assert primary[0]["score"] == 0.9
+
+    def test_uses_rerank_score_when_present(self):
+        """有 rerank_score 时按 rerank_score 排序选"""
+        from internal.service.rag_service import RAGService
+        rag = RAGService.__new__(RAGService)
+        candidates = [
+            {"chunk_id": "a_0", "file_name": "a.pdf", "chunk_index": 0,
+             "score": 0.1, "rerank_score": 0.95},
+            {"chunk_id": "b_0", "file_name": "b.pdf", "chunk_index": 0,
+             "score": 0.9, "rerank_score": 0.30},
+        ]
+        primary = rag._diversify_by_document(candidates, top_k=2, max_per_doc=1)
+        # rerank 高的 a_0 应排第一
+        assert primary[0]["chunk_id"] == "a_0"
+
+
+# ==================== 内容预算 ====================
+class TestContextCharBudget:
+    """上下文按文档分配字符预算，回答「该用多少内容」"""
+
+    def test_per_doc_budget_truncation(self):
+        """单文档内容超预算 → 截断并提示（budget 有 1000 下限，用 2000 字内容触发）"""
+        from internal.service.rag_service import RAGService
+        from unittest.mock import patch, MagicMock
+        rag = RAGService.__new__(RAGService)
+
+        fake_cfg = MagicMock()
+        fake_cfg.retrieval.context_char_budget = 200  # 被下限抬到 1000
+        with patch('internal.service.rag_service.get_config', return_value=fake_cfg):
+            candidates = [
+                {"chunk_id": "a_0", "content": "X" * 2000, "file_name": "a.pdf",
+                 "chunk_index": 0, "score": 0.9, "rerank_score": 0.9},
+            ]
+            ctx = rag._build_context(candidates)
+        assert "已按文档预算截断" in ctx
+        # 内容被截断到 1000，不再含 2000 个 X
+        assert ctx.count("X") < 2000
+
+    def test_multi_doc_budget_split(self):
+        """多文档预算均分，各文档都保留内容"""
+        from internal.service.rag_service import RAGService
+        from unittest.mock import patch, MagicMock
+        rag = RAGService.__new__(RAGService)
+
+        fake_cfg = MagicMock()
+        fake_cfg.retrieval.context_char_budget = 2000
+        with patch('internal.service.rag_service.get_config', return_value=fake_cfg):
+            candidates = [
+                {"chunk_id": "a_0", "content": "甲" * 100, "file_name": "a.pdf",
+                 "chunk_index": 0, "score": 0.9, "rerank_score": 0.9},
+                {"chunk_id": "b_0", "content": "乙" * 100, "file_name": "b.pdf",
+                 "chunk_index": 0, "score": 0.8, "rerank_score": 0.8},
+            ]
+            ctx = rag._build_context(candidates)
+        # 两个文档内容都应在上下文里
+        assert "甲" in ctx
+        assert "乙" in ctx
+
+    def test_full_doc_not_truncated(self):
+        """完整文档（用户手动召回）不参与预算截断"""
+        from internal.service.rag_service import RAGService
+        from unittest.mock import patch, MagicMock
+        rag = RAGService.__new__(RAGService)
+
+        fake_cfg = MagicMock()
+        fake_cfg.retrieval.context_char_budget = 100  # 极小
+        with patch('internal.service.rag_service.get_config', return_value=fake_cfg):
+            candidates = [
+                {"chunk_id": "a__full", "content": "全文内容" * 200, "file_name": "a.pdf",
+                 "chunk_index": -1, "score": 0.0, "is_full_doc": True}
+            ]
+            ctx = rag._build_context(candidates)
+        assert "已按文档预算截断" not in ctx
+        assert "全文内容" in ctx
+
+
+# ==================== 邻居进入上下文（修复回归）====================
+class TestNeighborsReachContext:
+    """关键回归：邻居扩展后不应被 [:top_k] 切掉，必须进入上下文"""
+
+    @patch('internal.service.rag_service.EmbeddingService')
+    @patch('internal.service.rag_service.ESService')
+    @patch('internal.service.rag_service.LLMService')
+    def test_neighbors_in_context_not_cut(self, mock_llm, mock_es, mock_emb):
+        """top_k=1，命中1块 + 召回2邻居 → 上下文含邻居，sources 只含 primary"""
+        import numpy as np
+        from internal.service.rag_service import RAGService
+
+        mock_emb_instance = MagicMock()
+        mock_emb_instance.encode_query.return_value = np.random.randn(512).astype(np.float32)
+        mock_emb.return_value = mock_emb_instance
+
+        mock_es_instance = MagicMock()
+        # search 返回 2 个候选（同文档），让 diversity cap=2 都进 primary
+        mock_es_instance.search_hybrid.return_value = [
+            {"chunk_id": "a_2", "content": "主命中C2", "file_name": "a.pdf",
+             "chunk_index": 2, "score": 0.9},
+        ]
+        # 邻居扩展返回 主命中 + 邻居1,3
+        def expand(cands, window=1, **kw):
+            return cands + [
+                {"chunk_id": "a_1", "content": "邻居C1", "file_name": "a.pdf",
+                 "chunk_index": 1, "section_title": "", "score": 0.0},
+                {"chunk_id": "a_3", "content": "邻居C3", "file_name": "a.pdf",
+                 "chunk_index": 3, "section_title": "", "score": 0.0},
+            ]
+        mock_es_instance.expand_neighbors.side_effect = expand
+        mock_es_instance.list_file_names.return_value = []
+        mock_es.return_value = mock_es_instance
+
+        captured_context = {"ctx": None}
+        def fake_generate(question, context, **kw):
+            captured_context["ctx"] = context
+            return "答案"
+        mock_llm_instance = MagicMock()
+        mock_llm_instance.generate.side_effect = fake_generate
+        mock_llm.return_value = mock_llm_instance
+
+        rag = RAGService(embedding_service=mock_emb_instance,
+                         es_service=mock_es_instance, llm_service=mock_llm_instance)
+        result = rag.query(question="测试", api_key="sk-test", top_k=1)
+
+        ctx = captured_context["ctx"]
+        # 邻居内容必须出现在上下文里（旧 bug 会被 [:top_k] 切掉）
+        assert "邻居C1" in ctx
+        assert "邻居C3" in ctx
+        # sources 只含 primary（1 个），不含邻居
+        assert len(result["sources"]) == 1
+        assert result["sources"][0]["file_name"] == "a.pdf"
+        # trace 记录邻居数
+        assert result["timing"].get("neighbor_expanded") == 2
+
+
+# ==================== 端到端：多文档一次引用 ====================
+class TestEndToEndMultiDocDiversity:
+    """端到端：检索到多文档候选时，primary 覆盖多文档"""
+
+    @patch('internal.service.rag_service.EmbeddingService')
+    @patch('internal.service.rag_service.ESService')
+    @patch('internal.service.rag_service.LLMService')
+    def test_primary_covers_multiple_docs(self, mock_llm, mock_es, mock_emb):
+        import numpy as np
+        from internal.service.rag_service import RAGService
+        from unittest.mock import patch as _patch, MagicMock
+
+        mock_emb_instance = MagicMock()
+        mock_emb_instance.encode_query.return_value = np.random.randn(512).astype(np.float32)
+        mock_emb.return_value = mock_emb_instance
+
+        mock_es_instance = MagicMock()
+        # 检索返回 6 候选，来自 3 个文档（每文档2个）
+        mock_es_instance.search_hybrid.return_value = [
+            {"chunk_id": f"{d}_{i}", "content": f"{d}内容{i}",
+             "file_name": f"{d}.pdf", "chunk_index": i, "score": 0.9 - i * 0.1 - n * 0.05}
+            for n, d in enumerate(["a", "b", "c"]) for i in range(2)
+        ]
+        mock_es_instance.expand_neighbors.side_effect = lambda c, **kw: c
+        mock_es_instance.list_file_names.return_value = []
+        mock_es.return_value = mock_es_instance
+
+        mock_llm_instance = MagicMock()
+        mock_llm_instance.generate.return_value = "答案"
+        mock_llm.return_value = mock_llm_instance
+
+        # max_per_doc=1 强制每文档至多 1 个，top_k=3 → 3 个不同文档各 1
+        fake_cfg = MagicMock()
+        fake_cfg.retrieval.max_chunks_per_doc = 1
+        fake_cfg.retrieval.enable_doc_diversity = True
+        fake_cfg.retrieval.enable_neighbor_expansion = True
+        fake_cfg.retrieval.neighbor_window = 1
+        fake_cfg.retrieval.enable_full_document = True
+        fake_cfg.retrieval.min_score = 0.0
+        fake_cfg.retrieval.context_char_budget = 6000
+        fake_cfg.conversation = MagicMock(source_boost=0.0, summary_threshold=3,
+                                           follow_up_vector_use_expanded=True,
+                                           enable_query_vector_cache=False,
+                                           query_vector_cache_size=128,
+                                           enable_query_rewrite=True, enable_intent_llm=False,
+                                           intent_rule_confidence_threshold=0.85,
+                                           enable_full_document=True, max_history=5,
+                                           context_window=8000, source_boost_decay=5,
+                                           intent_model="gpt-4o-mini")
+
+        with _patch('internal.service.rag_service.get_config', return_value=fake_cfg):
+            rag = RAGService(embedding_service=mock_emb_instance,
+                             es_service=mock_es_instance, llm_service=mock_llm_instance)
+            result = rag.query(question="有哪些相关内容", api_key="sk-test", top_k=3)
+
+        # sources 应覆盖 3 个不同文档（max_per_doc=1, top_k=3）
+        source_docs = {s["file_name"] for s in result["sources"]}
+        assert len(source_docs) == 3
+        assert result["trace"]["primary_count"] == 3
+

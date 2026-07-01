@@ -73,6 +73,11 @@ class RetrievalConfig(BaseModel):
     # 邻域上下文扩展：命中某 chunk 后，召回同文档相邻 chunk 拼接上下文
     enable_neighbor_expansion: bool = True
     neighbor_window: int = 1  # 前后各扩展 N 个 chunk
+    # 文档多样性（MMR 简化版）：确保 top_k 覆盖多个文档，避免单文档垄断答案
+    enable_doc_diversity: bool = True
+    max_chunks_per_doc: int = 2  # 单文档在 primary 中的最大 chunk 数
+    # 上下文内容预算（字符数）：保护模型上下文窗口，按文档分配额度
+    context_char_budget: int = 6000
 
 
 class ConversationConfig(BaseModel):
