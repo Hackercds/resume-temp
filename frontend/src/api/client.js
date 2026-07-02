@@ -21,7 +21,9 @@ class ApiClient {
             top_k: body.top_k || 5,
             history: body.history || [],
             session_id: body.session_id || null,
-            retrieve_full_doc: body.retrieve_full_doc || false
+            retrieve_full_doc: body.retrieve_full_doc || false,
+            view_only: body.view_only || false,
+            full_doc_files: body.full_doc_files || null
         };
         const res = await fetch(`${API_BASE}/api/query`, {
             method: 'POST',
@@ -44,7 +46,9 @@ class ApiClient {
             top_k: body.top_k || 5,
             history: body.history || [],
             session_id: body.session_id || null,
-            retrieve_full_doc: body.retrieve_full_doc || false
+            retrieve_full_doc: body.retrieve_full_doc || false,
+            view_only: body.view_only || false,
+            full_doc_files: body.full_doc_files || null
         };
 
         // 兜底：即使后端漏过滤，前端再清一遍 {{retrieve_full_doc:...}} 标记
