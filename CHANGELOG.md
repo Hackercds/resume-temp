@@ -265,3 +265,41 @@
 
 ### Tests
 - 全量 107 个测试通过（原 104 + 新增 3）
+
+## [1.6.0] - 2026-07-02
+
+### 修复「5个答案」+ 流式标记泄露
+
+#### 问题诊断
+- 用户问多部分问题，返回 5 个答案拼接：
+  - 旧设计让 LLM 输出 {{retrieve_full_doc:文件名}} 标记，后端召回完整文档后重新生成整个答案
+  - 多文档/多部分问题让 LLM 多次输出标记，级联重新生成，产生多个答案拼接
+  - 每次重新生成耗时 10s+，5 个答案 = ~50s，且混乱
+- 流式 token 中标记被拆开（如 `{{retrieve` + `_full_doc:x.pdf}}`）：
+  - 逐 token 用完整正则无法匹配，标记片段泄露给用户
+
+#### 修复
+- **移除自动全文召回标记特性**：prompt 不再指示 LLM 输出 {{retrieve_full_doc}} 标记；
+  query/query_stream 移除自动检测标记重新生成的代码块。初始检索（向量+BM25+邻域扩展+
+  实体文档扩展）已提供足够上下文；用户需要全文可手动点「召回完整文档」按钮
+  （retrieve_full_doc=true 走短路直接返回文档原文，不调 LLM）
+- **流式标记过滤状态机** `_filter_stream_marks`：缓存跨 token 拆开的未闭合 {{，
+  拼齐后判断是否合法标记，合法则丢弃，普通 {{ 文本则释放。流结束 flush 时
+  未闭合的标记前缀丢弃，不泄露给用户
+- `_strip_retrieve_marks` 保留作 done 时的兜底双重保险
+
+### Added
+- `rag_service._filter_stream_marks`、`_flush_stream_mark_buf`
+- 7 个专项测试：完整标记、跨2/3 token 拆开、普通花括号、flush 丢弃标记前缀
+
+### Changed
+- `llm_service._build_prompt` 移除 {{retrieve_full_doc}} 标记指令
+- query/query_stream 移除自动重新生成代码块
+- 流式 token 用 `_filter_stream_marks` 替代 `_strip_retrieve_marks`
+
+### Tests
+- 全量 114 个测试通过（原 107 + 新增 7）
+
+### Fixed
+- 多部分问题返回多个答案拼接（5个答案）的级联重新生成
+- 流式标记被拆开后片段泄露给用户（如 `{{retrieve_full_doc`）

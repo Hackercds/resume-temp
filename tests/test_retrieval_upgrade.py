@@ -1209,3 +1209,65 @@ class TestFullDocStreamShortCircuit:
         assert "完整文档内容" in combined
         assert "完整文档内容" in done_events[0]["answer"]
         assert done_events[0]["timing"].get("full_doc_retrieval") is True
+
+
+# ==================== 流式标记过滤（跨 token 拆开）====================
+class TestStreamMarkFilter:
+    """跨 token 拆开的 {{retrieve_full_doc}} 标记过滤"""
+
+    def _new_rag(self):
+        from internal.service.rag_service import RAGService
+        rag = RAGService.__new__(RAGService)
+        rag._stream_mark_buf = ''
+        return rag
+
+    def test_complete_mark_in_one_token(self):
+        """完整标记在一个 token → 整段丢弃"""
+        rag = self._new_rag()
+        out = rag._filter_stream_marks("前文 {{retrieve_full_doc:a.pdf}} 后文")
+        assert "retrieve_full_doc" not in out
+        assert "前文" in out and "后文" in out
+
+    def test_mark_split_across_tokens(self):
+        """标记拆成两个 token → 拼齐后丢弃，不泄露片段"""
+        rag = self._new_rag()
+        out1 = rag._filter_stream_marks("员工。{{retrieve_full_doc")
+        out2 = rag._filter_stream_marks(":a.pdf}} 结尾")
+        combined = out1 + out2
+        assert "retrieve_full_doc" not in combined
+        assert "员工。" in combined
+        assert "结尾" in combined
+
+    def test_mark_split_three_parts(self):
+        """标记拆成三部分 → 仍正确过滤"""
+        rag = self._new_rag()
+        out1 = rag._filter_stream_marks("答 {{retrieve")
+        out2 = rag._filter_stream_marks("_full_doc:b.pdf")
+        out3 = rag._filter_stream_marks("}} 完")
+        combined = out1 + out2 + out3
+        assert "retrieve_full_doc" not in combined
+        assert "答" in combined and "完" in combined
+
+    def test_normal_braces_not_cached(self):
+        """普通 {{ 文本（非标记前缀）不缓存，立即释放"""
+        rag = self._new_rag()
+        out = rag._filter_stream_marks("公式 {{ x + y }} 正常")
+        assert "{{ x + y }}" in out  # 普通花括号保留
+
+    def test_flush_releases_leftover(self):
+        """流结束：未闭合的标记前缀 buffer 丢弃（不泄露）"""
+        rag = self._new_rag()
+        rag._filter_stream_marks("文本 {{retrieve")  # 缓存未闭合标记
+        leftover = rag._flush_stream_mark_buf()
+        assert leftover == ''  # 标记前缀丢弃，不泄露给用户
+
+    def test_no_mark_normal_text_passthrough(self):
+        """无标记的普通文本直接通过"""
+        rag = self._new_rag()
+        assert rag._filter_stream_marks("普通答案文本") == "普通答案文本"
+
+    def test_multiple_marks_in_one_token(self):
+        """一个 token 含多个标记 → 全部丢弃"""
+        rag = self._new_rag()
+        out = rag._filter_stream_marks("{{retrieve_full_doc:a.pdf}}{{retrieve_full_doc:b.pdf}}")
+        assert "retrieve_full_doc" not in out

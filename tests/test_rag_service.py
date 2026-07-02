@@ -271,7 +271,7 @@ class TestRetrieveFullDocMarks:
     @patch('internal.service.rag_service.ESService')
     @patch('internal.service.rag_service.LLMService')
     def test_query_strips_mark_from_final_answer(self, mock_llm, mock_es, mock_emb):
-        """query 完整流程：答案中的标记会被剥离后再返回"""
+        """query 完整流程：答案中残留的标记会被剥离后返回（不再自动重新生成）"""
         from internal.service.rag_service import RAGService
 
         mock_emb_instance = MagicMock()
@@ -283,19 +283,12 @@ class TestRetrieveFullDocMarks:
             {"chunk_id": "c1", "content": "x", "file_name": "a.pdf", "chunk_index": 0, "score": 0.5}
         ]
         mock_es_instance.expand_neighbors.side_effect = lambda cands, **kw: cands
-        # 全文召回返回完整文档
-        mock_es_instance.retrieve_full_document.return_value = {
-            "chunk_id": "a.pdf__full_doc", "content": "完整内容", "file_name": "a.pdf",
-            "score": 0, "is_full_doc": True
-        }
+        mock_es_instance.list_file_names.return_value = []
         mock_es.return_value = mock_es_instance
 
-        # LLM 第一次返回带标记的答案，第二次返回不带标记
+        # LLM 返回带标记的答案（已不再指示输出，但作为防御性兜底测试清理逻辑）
         mock_llm_instance = MagicMock()
-        mock_llm_instance.generate.side_effect = [
-            "需要更多细节 {{retrieve_full_doc:a.pdf}}",
-            "完整内容已生成"
-        ]
+        mock_llm_instance.generate.return_value = "需要更多细节 {{retrieve_full_doc:a.pdf}}"
         mock_llm.return_value = mock_llm_instance
 
         rag = RAGService(
@@ -306,11 +299,12 @@ class TestRetrieveFullDocMarks:
 
         result = rag.query(question="细节", api_key="sk-test")
 
-        # 最终答案不应包含标记
+        # 最终答案不应包含标记（被 _strip_retrieve_marks 清理）
         assert "{{retrieve_full_doc" not in result["answer"]
-        assert result["answer"] == "完整内容已生成"
-        # trace 中应记录触发了全文召回
-        assert result["trace"]["full_doc_requested"] is True
+        assert "需要更多细节" in result["answer"]
+        # 不再触发自动全文召回重新生成（已移除该特性，避免多答案级联）
+        mock_es_instance.retrieve_full_document.assert_not_called()
+        assert mock_llm_instance.generate.call_count == 1  # 只调一次，不重新生成
 
 
 class TestRateLimiter:

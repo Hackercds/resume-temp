@@ -429,35 +429,10 @@ class RAGService:
             llm_time = time.time() - llm_start
             timing["llm_s"] = round(llm_time, 1)
 
-            # Step 11: 检测 LLM 请求的所有完整文档（去重保序，逐个召回）
-            requested_files = self._need_full_documents(answer)
-            if requested_files and not retrieve_full_doc and get_config().retrieval.enable_full_document:
-                self.logger.info(trace_id, "rag_service",
-                                 "LLM 请求召回整篇文档", files=requested_files)
-                full_docs = self._retrieve_full_documents(requested_files)
-                if full_docs:
-                    full_context = self._build_context(full_docs)
-                    try:
-                        answer = self.llm.generate(
-                            question=question,
-                            context=full_context,
-                            api_key=api_key,
-                            provider=provider,
-                            model=model,
-                            base_url=base_url,
-                            history=compressed_history,
-                            allow_full_doc_retrieval=False
-                        )
-                        primary = full_docs
-                        context_candidates = full_docs
-                        timing["full_doc_retrieval"] = True
-                        trace["full_doc_requested"] = True
-                        trace["full_doc_files"] = requested_files
-                    except LLMAPIError as e:
-                        self.logger.error(trace_id, "rag_service",
-                                          "整篇文档重新生成失败", error=str(e))
-
-            # 清理答案中可能残留的 retrieve_full_doc 标记（防泄露给用户）
+            # 防御性清理：移除答案中可能残留的 retrieve_full_doc 标记（LLM 不再被指示输出，
+            # 但作为兜底）。已移除自动重新生成逻辑——旧设计让 LLM 输出标记触发全文召回并
+            # 重新生成整个答案，多文档问题会级联产生多个答案拼接，且每次耗时10s+。
+            # 用户需要全文可手动点「召回完整文档」按钮（retrieve_full_doc=true 走短路返回原文）。
             answer = self._strip_retrieve_marks(answer)
 
             # 构造返回（sources 用 primary 多样化命中；context 已含邻居）
@@ -910,7 +885,7 @@ class RAGService:
                 ):
                     # 过滤掉 retrieve_full_doc 标记：把标记拆开，按字符逐个输出
                     # 如果 token 包含标记，把标记部分替换为空再输出
-                    cleaned_token = self._strip_retrieve_marks(token)
+                    cleaned_token = self._filter_stream_marks(token)
                     if cleaned_token:  # 跳过空 token（标记整段被吃掉）
                         answer_parts.append(cleaned_token)
                         yield {"type": "token", "content": cleaned_token}
@@ -921,50 +896,19 @@ class RAGService:
             llm_time = time.time() - llm_start
             timing["llm_s"] = round(llm_time, 1)
 
-            # answer_parts 已经过滤标记，但若标记被截断到两个 token 中间，
-            # 仍可能残留完整标记，需再次清理
+            # 释放流式标记缓存残留（未闭合 buffer，已确认非合法标记），并入答案
+            leftover = self._flush_stream_mark_buf()
+            if leftover:
+                answer_parts.append(leftover)
+                yield {"type": "token", "content": leftover}
+
+            # 兜底清理（filter 已处理，防御性双重保险）
             answer = "".join(answer_parts)
             answer = self._strip_retrieve_marks(answer)
-            answer_parts = [answer]  # 后续以清理后的内容继续
 
-            # Step 11: 检测 LLM 请求的所有完整文档（去重保序，逐个召回）
-            requested_files = self._need_full_documents(answer)
-            if requested_files and not retrieve_full_doc and get_config().retrieval.enable_full_document:
-                self.logger.info(trace_id, "rag_service",
-                                 "流式查询 LLM 请求召回整篇文档",
-                                 files=requested_files)
-                yield {"type": "token", "content": "\n\n[正在召回完整文档...]\n"}
-                full_docs = self._retrieve_full_documents(requested_files)
-                if full_docs:
-                    full_context = self._build_context(full_docs)
-                    answer_parts = []
-                    try:
-                        async for token in self.llm.generate_stream(
-                            question=question,
-                            context=full_context,
-                            api_key=api_key,
-                            provider=provider,
-                            model=model,
-                            base_url=base_url,
-                            history=compressed_history,
-                            allow_full_doc_retrieval=False
-                        ):
-                            # 全文召回阶段也过滤可能的标记
-                            cleaned_token = self._strip_retrieve_marks(token)
-                            if cleaned_token:
-                                answer_parts.append(cleaned_token)
-                                yield {"type": "token", "content": cleaned_token}
-                        answer = "".join(answer_parts)
-                        answer = self._strip_retrieve_marks(answer)
-                        primary = full_docs
-                        context_candidates = full_docs
-                        timing["full_doc_retrieval"] = True
-                        trace["full_doc_requested"] = True
-                        trace["full_doc_files"] = requested_files
-                    except LLMAPIError as e:
-                        self.logger.error(trace_id, "rag_service",
-                                          "整篇文档流式重新生成失败", error=str(e))
-                        yield {"type": "error", "message": f"完整文档重新生成失败: {str(e)}", "trace_id": trace_id}
+            # 已移除自动全文召回重新生成（旧设计让 LLM 输出标记触发重新生成整个答案，
+            # 多文档问题级联产生多个答案拼接 + 每次耗时10s+）。用户需要全文可手动点
+            # 「召回完整文档」按钮（retrieve_full_doc=true 走短路返回文档原文，不调 LLM）。
 
             yield {
                 "type": "done",
@@ -1157,6 +1101,72 @@ class RAGService:
         if not text:
             return text
         return self._RETRIEVE_MARK.sub("", text).strip()
+
+    def _filter_stream_marks(self, token: str) -> str:
+        """
+        流式标记过滤：处理跨 token 被拆开的 {{retrieve_full_doc:xxx}} 标记。
+        状态机：遇到未闭合的 {{ 开头时缓存到 buffer，等后续 token 拼齐判断。
+        - 拼出完整标记 → 丢弃（不泄露给用户）
+        - 拼到一定长度仍无 }} 且不像标记 → 释放 buffer（避免无限缓存正常文本）
+        面试点：为什么流式要单独处理？
+        答：LLM 的 {{retrieve_full_doc:a.pdf}} 可能被拆成多个 token 到达
+           （如 "{{retrieve" + "_full_doc:a.pdf}}"），逐 token 用完整正则无法匹配，
+           导致标记片段泄露给用户。状态机缓存未闭合的 {{，拼齐后再判断。
+        """
+        if not hasattr(self, '_stream_mark_buf'):
+            self._stream_mark_buf = ''
+
+        buf = self._stream_mark_buf + token
+        result_parts = []
+        last_end = 0
+        # 用完整正则找出所有已闭合的标记，丢弃它们，保留标记之间的文本
+        for m in self._RETRIEVE_MARK.finditer(buf):
+            result_parts.append(buf[last_end:m.start()])
+            last_end = m.end()
+        tail = buf[last_end:]  # 最后一个标记之后的剩余
+
+        # 检查 tail 是否含未闭合的 {{（标记可能跨 token）
+        mark_open = tail.rfind('{{')
+        if mark_open >= 0:
+            after_open = tail[mark_open:]
+            # 若 {{ 后已有 }} 但正则没匹配（格式不合法）→ 不是标记，释放全部
+            if '}}' in after_open:
+                result_parts.append(tail)
+                self._stream_mark_buf = ''
+            else:
+                # 有 {{ 无 }}：判断 {{ 后是否像标记前缀
+                after_brace = after_open[2:].lstrip()
+                looks_like_mark = (after_brace.startswith('retrieve')
+                                   or after_open == '{{')
+                if looks_like_mark and len(after_open) <= 80:
+                    # 缓存未闭合标记部分，等下一 token
+                    result_parts.append(tail[:mark_open])
+                    self._stream_mark_buf = after_open
+                else:
+                    # 不像标记前缀，或超长 → 普通 {{ 文本，释放
+                    result_parts.append(tail)
+                    self._stream_mark_buf = ''
+        else:
+            result_parts.append(tail)
+            self._stream_mark_buf = ''
+
+        return ''.join(result_parts)
+
+    def _flush_stream_mark_buf(self) -> str:
+        """
+        流式结束时处理缓存中残留的未闭合 buffer。
+        - 若 buffer 是未闭合的标记前缀（以 {{retrieve 开头）→ 丢弃（不泄露给用户）
+        - 否则（普通 {{ 文本）→ 释放作为正常文本
+        """
+        buf = getattr(self, '_stream_mark_buf', '')
+        self._stream_mark_buf = ''
+        if not buf:
+            return ''
+        # 未闭合的标记前缀（如 "{{retrieve_full_doc"）→ 丢弃
+        stripped = buf[2:].lstrip() if buf.startswith('{{') else ''
+        if stripped.startswith('retrieve') or buf == '{{':
+            return ''  # 丢弃，不泄露标记片段
+        return buf  # 普通文本，释放
 
     def _split_for_stream(self, text: str, size: int = 200) -> List[str]:
         """
