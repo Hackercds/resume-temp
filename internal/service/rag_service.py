@@ -833,7 +833,49 @@ class RAGService:
                     list({c["file_name"] for c in primary})
                 )
                 if full_docs:
-                    primary = full_docs
+                    # 短路：直接流式返回文档原文，不调 LLM
+                    # 面试点：为什么完整文档召回不调 LLM？
+                    # 答：完整文档 context 可能几万字，LLM 处理超长 context 极慢（10-30s），
+                    # 且用户要的是文档原文而非总结。直接分块 yield 原文，零 LLM 延迟，
+                    # 前端即时显示，彻底解决「召回完整文档耗时长、前端卡死」。
+                    answer_parts = []
+                    for doc in full_docs:
+                        fn = doc.get("file_name", "")
+                        content = doc.get("content", "") or ""
+                        if not content:
+                            continue
+                        header = f"📄 {fn}\n\n"
+                        answer_parts.append(header)
+                        yield {"type": "token", "content": header}
+                        # 按段落分块流式输出，每块 ~200 字，即时反馈
+                        chunks = self._split_for_stream(content, 200)
+                        for piece in chunks:
+                            answer_parts.append(piece)
+                            yield {"type": "token", "content": piece}
+                    answer = "".join(answer_parts)
+                    timing["llm_s"] = 0.0
+                    timing["full_doc_retrieval"] = True
+                    trace["full_doc_requested"] = True
+                    trace["full_doc_files"] = [d.get("file_name") for d in full_docs]
+                    yield {
+                        "type": "done",
+                        "answer": answer,
+                        "sources": [
+                            {
+                                "content": d.get("content", "")[:500],
+                                "file_name": d.get("file_name", ""),
+                                "score": 0,
+                                "section_title": "",
+                                "chunk_index": -1,
+                                "is_full_doc": True,
+                            }
+                            for d in full_docs
+                        ],
+                        "trace_id": trace_id,
+                        "timing": timing,
+                        "trace": trace,
+                    }
+                    return
 
             # Step 9: 邻域上下文扩展 → context_candidates
             context_candidates = list(primary)
@@ -1115,6 +1157,32 @@ class RAGService:
         if not text:
             return text
         return self._RETRIEVE_MARK.sub("", text).strip()
+
+    def _split_for_stream(self, text: str, size: int = 200) -> List[str]:
+        """
+        把长文本按段落/指定长度切分，用于流式分块输出。
+        优先在段落/句子边界切，避免切断词。
+        """
+        if not text:
+            return []
+        if len(text) <= size:
+            return [text]
+        parts = []
+        start = 0
+        n = len(text)
+        while start < n:
+            end = min(start + size, n)
+            if end < n:
+                # 在 [start, end] 找最近的换行/句号切分
+                snippet = text[start:end]
+                for br in ['\n\n', '\n', '。', '；', '！', '？', ' ']:
+                    pos = snippet.rfind(br)
+                    if pos > size // 2:
+                        end = start + pos + len(br)
+                        break
+            parts.append(text[start:end])
+            start = end
+        return parts
 
     def _retrieve_full_documents(self, file_names: List[str]) -> List[Dict]:
         """按 file_name 召回整篇文档"""

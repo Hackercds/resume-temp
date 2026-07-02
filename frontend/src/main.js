@@ -412,7 +412,7 @@ app.component('chat-panel', {
             this.loading = true; this.statusText = '向量化中';
             this.error = ''; this.errorSuggestion = ''; this.errorRetryable = false; this.emptyRetrieval = false;
             this.followUpQuestions = [];
-            this.scrollToBottom();
+            this.forceScrollToBottom();  // 用户发送，强制滚到底
 
             const history = this.messages
                 .filter(m => m.role === 'user' || m.role === 'assistant')
@@ -455,15 +455,33 @@ app.component('chat-panel', {
                 // 不做 rAF 节流/限量释放——LLM 本身按 token 流式返回，前端忠实显示即可。
                 // 若某些模型/代理批量返回，那是后端特性，前端伪造流式反而引入 bug
                 // （光标残留、内容丢失）。简单 = 可靠。
+                // 滚动节流：多个 token 快速到达时合并到一帧一次 scrollToBottom，避免卡顿
+                let scrollRaf = null;
+                const throttledScroll = () => {
+                    if (scrollRaf === null) {
+                        scrollRaf = requestAnimationFrame(() => {
+                            scrollRaf = null;
+                            this.scrollToBottom();
+                        });
+                    }
+                };
                 await ApiClient.queryStream(
                     body,
                     (token) => {
                         assistantMsg.content += token;
                         this.statusText = '生成中';
-                        this.scrollToBottom();
+                        throttledScroll();
                     },
                     (data) => {
-                        assistantMsg.content = data.answer || assistantMsg.content;
+                        // 校准 content：仅当 answer 比已流式内容更长时才覆盖
+                        // （避免 done 的 answer 与流式 token 一致时覆盖导致内容跳动；
+                        //  全文重生成时 answer 更完整才覆盖）
+                        const ans = data.answer || '';
+                        if (ans && ans.length > (assistantMsg.content || '').length) {
+                            assistantMsg.content = ans;
+                        } else if (!assistantMsg.content) {
+                            assistantMsg.content = ans;
+                        }
                         assistantMsg.sources = data.sources || [];
                         assistantMsg.timing = data.timing || null;
                         assistantMsg.trace_id = data.trace_id || '';
@@ -531,7 +549,19 @@ app.component('chat-panel', {
 
             this.loading = true; this.error = ''; this.errorSuggestion = ''; this.errorRetryable = false; this.emptyRetrieval = false;
 
-            for (const fileName of targetFiles) {
+            // 滚动节流（流式期间合并到一帧一次，避免长文档卡顿）
+            let scrollRaf = null;
+            const throttledScroll = () => {
+                if (scrollRaf === null) {
+                    scrollRaf = requestAnimationFrame(() => {
+                        scrollRaf = null;
+                        this.scrollToBottom();
+                    });
+                }
+            };
+
+            // 并发召回多个文档（不串行 await 阻塞 UI）
+            const fetchOne = (fileName, insertIdx) => {
                 const fullDocMsg = {
                     id: Date.now() + Math.random(),
                     role: 'assistant',
@@ -547,49 +577,51 @@ app.component('chat-panel', {
                     streaming: true,
                     timestamp: Date.now()
                 };
-                this.messages.splice(idx + 1, 0, fullDocMsg);
+                this.messages.splice(insertIdx, 0, fullDocMsg);
 
-                try {
-                    const body = {
-                        question: queryText,
-                        api_key: this.apiConfig.apiKey,
-                        provider: this.apiConfig.provider,
-                        model: this.apiConfig.model || null,
-                        top_k: 5,
-                        history: [],
-                        session_id: this.currentSessionId,
-                        retrieve_full_doc: true
-                    };
-                    if (this.apiConfig.baseUrl) body.base_url = this.apiConfig.baseUrl;
+                const body = {
+                    question: queryText,
+                    api_key: this.apiConfig.apiKey,
+                    provider: this.apiConfig.provider,
+                    model: this.apiConfig.model || null,
+                    top_k: 5,
+                    history: [],
+                    session_id: this.currentSessionId,
+                    retrieve_full_doc: true
+                };
+                if (this.apiConfig.baseUrl) body.base_url = this.apiConfig.baseUrl;
 
-                    // 流式：token 到达即追加，done 校准 answer，立即切 Markdown（同 doQuery 简版）
-                    await ApiClient.queryStream(
-                        body,
-                        (token) => {
-                            fullDocMsg.content += token;
-                            this.scrollToBottom();
-                        },
-                        (data) => {
-                            fullDocMsg.content = data.answer || fullDocMsg.content;
-                            fullDocMsg.sources = data.sources || [];
-                            fullDocMsg.timing = data.timing || null;
-                            fullDocMsg.trace_id = data.trace_id || '';
-                            fullDocMsg.trace = data.trace || null;
-                            fullDocMsg.streaming = false;
-                            this.saveSession();
-                        },
-                        (err) => {
-                            fullDocMsg.content = `⚠ ${err.message}`;
-                            fullDocMsg.streaming = false;
-                            this.$emit('notify', err.message, 'error');
+                return ApiClient.queryStream(
+                    body,
+                    (token) => {
+                        fullDocMsg.content += token;
+                        throttledScroll();
+                    },
+                    (data) => {
+                        const ans = data.answer || '';
+                        if (ans && ans.length > (fullDocMsg.content || '').length) {
+                            fullDocMsg.content = ans;
+                        } else if (!fullDocMsg.content) {
+                            fullDocMsg.content = ans;
                         }
-                    );
-                } catch (e) {
-                    fullDocMsg.content = `⚠ ${e.message}`;
-                    fullDocMsg.streaming = false;
-                    this.$emit('notify', e.message, 'error');
-                }
-            }
+                        fullDocMsg.sources = data.sources || [];
+                        fullDocMsg.timing = data.timing || null;
+                        fullDocMsg.trace_id = data.trace_id || '';
+                        fullDocMsg.trace = data.trace || null;
+                        fullDocMsg.streaming = false;
+                        this.saveSession();
+                    },
+                    (err) => {
+                        fullDocMsg.content = `⚠ ${err.message}`;
+                        fullDocMsg.streaming = false;
+                        this.$emit('notify', err.message, 'error');
+                    }
+                );
+            };
+
+            // 并发执行，每个文档插入到 idx+1 之后递增位置
+            const tasks = targetFiles.map((fn, i) => fetchOne(fn, idx + 1 + i));
+            await Promise.all(tasks);
 
             this.$emit('notify', `已召回完整文档：${targetFiles.join(', ')}`);
             this.loading = false;
@@ -661,6 +693,17 @@ app.component('chat-panel', {
             return first ? first.content.slice(0, 20) + (first.content.length > 20 ? '…' : '') : '新对话';
         },
         scrollToBottom() {
+            nextTick(() => {
+                const el = this.$refs.messageList;
+                if (!el) return;
+                // autoScroll：只在用户已接近底部时才自动滚到底
+                // （用户主动上滑阅读时，不被流式新内容反复拉回底部）
+                const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
+                if (dist <= 120) el.scrollTop = el.scrollHeight;
+            });
+        },
+        forceScrollToBottom() {
+            // 用户发送消息、切换会话等主动操作时强制滚到底
             nextTick(() => {
                 const el = this.$refs.messageList;
                 if (el) el.scrollTop = el.scrollHeight;

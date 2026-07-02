@@ -235,3 +235,33 @@
 - 结构化日志：traceId 贯穿全链路
 - API 文档：docs/api.md
 
+
+## [1.5.0] - 2026-07-02
+
+### 召回完整文档卡死 + 流式体验修复
+
+#### 问题诊断
+- 「召回完整文档」耗时极长、前端卡死（滚动被反复拉回）：
+  - 后端 retrieve_full_doc 把完整文档当 context 调 LLM，几万字 context 处理 10-30s
+  - 前端 retrieveFullDoc 对多文件串行 await，逐个等 LLM 完成才开始下一个
+  - 每个 token 触发 scrollToBottom 强制滚到底，用户上滑阅读被反复拉回
+- 流式「首句正常，后面整段出现」仍存在：
+  - done 事件 answer 覆盖 content，全文重生成时 answer 与流式 token 不一致导致跳动
+
+#### 修复
+- **完整文档召回短路**：retrieve_full_doc=True 时直接分块流式返回文档原文（_split_for_stream
+  按段落/句子边界切分，每块~200字），不调 LLM。零 LLM 延迟，前端即时显示
+- **autoScroll 策略**：scrollToBottom 只在用户已接近底部（≤120px）时自动滚；
+  forceScrollToBottom 仅用户主动发送/切会话时强制滚。上滑阅读不被打断
+- **滚动节流**：流式 token 快速到达时 rAF 合并到一帧一次 scrollToBottom，避免卡顿
+- **retrieveFullDoc 并发**：多文件 Promise.all 并发召回，不串行 await 阻塞 UI
+- **done 校准优化**：仅当 answer 比已流式 content 更长才覆盖，避免一致时覆盖导致内容跳动
+
+### Added
+- `rag_service._split_for_stream` 按句子边界切分长文本
+- `query_stream` 完整文档召回短路（直接 yield 原文，不调 LLM）
+- 前端 `forceScrollToBottom`、autoScroll 阈值、rAF 滚动节流
+- 3 个专项测试：split_for_stream 边界/短文本、完整文档召回短路不调 LLM
+
+### Tests
+- 全量 107 个测试通过（原 104 + 新增 3）

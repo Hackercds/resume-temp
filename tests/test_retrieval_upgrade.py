@@ -1138,3 +1138,74 @@ class TestEntityDocumentExpansion:
         assert result["trace"].get("entity_terms") == ["张成都"]
 
 
+
+
+# ==================== 完整文档召回短路（不调 LLM）+ 流式分块 ====================
+class TestFullDocStreamShortCircuit:
+    """retrieve_full_doc=True 时直接流式返回文档原文，不调 LLM"""
+
+    def test_split_for_stream_respects_sentence_boundary(self):
+        """_split_for_stream 在段落/句子边界切分，不切断词"""
+        from internal.service.rag_service import RAGService
+        rag = RAGService.__new__(RAGService)
+        text = "第一句。第二句比较长一些。第三句。" * 5
+        parts = rag._split_for_stream(text, 20)
+        assert len(parts) > 1
+        for p in parts[:-1]:
+            assert p.endswith(('。', '\n', '；', '！', '？', ' '))
+
+    def test_split_for_stream_short_text(self):
+        """短文本不切分"""
+        from internal.service.rag_service import RAGService
+        rag = RAGService.__new__(RAGService)
+        assert rag._split_for_stream("短文本", 200) == ["短文本"]
+        assert rag._split_for_stream("", 200) == []
+
+    @pytest.mark.asyncio
+    @patch('internal.service.rag_service.EmbeddingService')
+    @patch('internal.service.rag_service.ESService')
+    @patch('internal.service.rag_service.LLMService')
+    async def test_retrieve_full_doc_streams_raw_no_llm(self, mock_llm, mock_es, mock_emb):
+        """retrieve_full_doc=True 时直接流式返回文档原文，不调 LLM"""
+        import numpy as np
+        from internal.service.rag_service import RAGService
+
+        mock_emb_instance = MagicMock()
+        mock_emb_instance.encode_query.return_value = np.random.randn(512).astype(np.float32)
+        mock_emb.return_value = mock_emb_instance
+
+        mock_es_instance = MagicMock()
+        mock_es_instance.search_hybrid.return_value = [
+            {"chunk_id": "c1", "content": "x", "file_name": "a.pdf",
+             "chunk_index": 0, "score": 0.5}
+        ]
+        mock_es_instance.expand_neighbors.side_effect = lambda c, **kw: c
+        mock_es_instance.list_file_names.return_value = []
+        mock_es_instance.retrieve_full_document.return_value = {
+            "chunk_id": "a.pdf__full", "content": "这是完整文档内容。第二段。",
+            "file_name": "a.pdf", "score": 0, "is_full_doc": True
+        }
+        mock_es.return_value = mock_es_instance
+
+        mock_llm_instance = MagicMock()
+        mock_llm_instance.generate_stream = MagicMock()
+        mock_llm.return_value = mock_llm_instance
+
+        rag = RAGService(embedding_service=mock_emb_instance,
+                         es_service=mock_es_instance, llm_service=mock_llm_instance)
+
+        events = []
+        async for ev in rag.query_stream(question="测试", api_key="sk",
+                                         retrieve_full_doc=True, top_k=5):
+            events.append(ev)
+
+        # LLM 流式不应被调用（短路返回原文）
+        mock_llm_instance.generate_stream.assert_not_called()
+        token_events = [e for e in events if e["type"] == "token"]
+        done_events = [e for e in events if e["type"] == "done"]
+        assert len(token_events) >= 1
+        assert len(done_events) == 1
+        combined = "".join(e["content"] for e in token_events)
+        assert "完整文档内容" in combined
+        assert "完整文档内容" in done_events[0]["answer"]
+        assert done_events[0]["timing"].get("full_doc_retrieval") is True
