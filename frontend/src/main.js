@@ -255,7 +255,7 @@ app.component('chat-panel', {
                                 <button v-if="!msg.isFullDoc && dedupedSources(msg).length >= 1"
                                     class="btn-multi-deep" :disabled="!(msg.selectedDocs && msg.selectedDocs.length)"
                                     @click="deepAnswerMulti(msg)">
-                                    🔍 召回所选文档生成深度回答{{ msg.selectedDocs && msg.selectedDocs.length ? `（${msg.selectedDocs.length} 个）` : '（未选择）' }}
+                                    🔍 召回所选文档生成深度回答{{ msg.selectedDocs && msg.selectedDocs.length ? '（' + msg.selectedDocs.length + ' 个）' : '（未选择）' }}
                                 </button>
                             </div>
                             <button v-if="msg.trace" class="trace-toggle" @click="msg.showTrace = !msg.showTrace">
