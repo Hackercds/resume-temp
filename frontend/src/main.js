@@ -451,14 +451,36 @@ app.component('chat-panel', {
                 };
                 if (this.apiConfig.baseUrl) body.base_url = this.apiConfig.baseUrl;
 
+                // 流式 token 累积 + requestAnimationFrame 节流渲染
+                // 面试点：为什么节流？多个 token 快速到达时，Vue 对长文本的响应式
+                // 更新会逐次 diff 整个文本节点，累积卡顿表现为「后面一段突然全出」。
+                // rAF 合并到每帧一次刷新，流式输出更顺滑。
+                let streamBuf = '';
+                let rafScheduled = false;
+                const flushStream = () => {
+                    rafScheduled = false;
+                    if (streamBuf) {
+                        assistantMsg.content += streamBuf;
+                        streamBuf = '';
+                        this.statusText = '生成中';
+                        this.scrollToBottom();
+                    }
+                };
+
                 await ApiClient.queryStream(
                     body,
                     (token) => {
-                        assistantMsg.content += token;
-                        this.statusText = '生成中';
-                        this.scrollToBottom();
+                        streamBuf += token;
+                        if (!rafScheduled) {
+                            rafScheduled = true;
+                            requestAnimationFrame(flushStream);
+                        }
                     },
                     (data) => {
+                        // done 前最后刷一次，确保 buffer 内容进 content
+                        if (rafScheduled) cancelAnimationFrame(rafScheduled);
+                        rafScheduled = false;
+                        if (streamBuf) { assistantMsg.content += streamBuf; streamBuf = ''; }
                         assistantMsg.content = data.answer || assistantMsg.content;
                         assistantMsg.sources = data.sources || [];
                         assistantMsg.timing = data.timing || null;

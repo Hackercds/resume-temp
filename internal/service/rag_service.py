@@ -328,7 +328,7 @@ class RAGService:
 
             # Step 4.5: 实体文档扩展（单实体也触发）
             # 解决「张成都是谁」只召回一篇论文：对核心实体做 BM25，
-            # 把包含实体但未进候选池的文档代表 chunk 注入，确保多文档覆盖
+            # 把包含实体但未进候选池的文档代表 chunk 注入，并标记实体命中文档
             entity_terms = self._extract_entity_terms(expanded_question)
             if entity_terms:
                 entity_reps = self._expand_entity_documents(
@@ -338,6 +338,10 @@ class RAGService:
                         candidates.append(c)
                     timing["entity_doc_expanded"] = len(entity_reps)
                     trace["entity_terms"] = entity_terms
+                # 标记候选池里实体命中的文档，多样性选择时优先覆盖
+                marked = self._mark_entity_matched_chunks(candidates, entity_terms)
+                if marked:
+                    trace["entity_matched_chunks"] = marked
 
             # Step 5: 文档多样性选择 → primary（回答「其他文档为什么不能一次引用」）
             # 单文档 cap + MMR 贪心，确保 top_k 覆盖多文档
@@ -573,22 +577,40 @@ class RAGService:
             # 候选不多于 top_k，无需多样性裁剪，直接按分数取
             return self._sort_candidates_by_score(candidates)[:top_k]
 
-        # 1. 按分数降序（rerank_score 优先，回退 score）
+        # 1. 按分数降序（rerank_score 优先，回退 score），但 entity_match 优先
         ranked = self._sort_candidates_by_score(candidates)
+        # entity_match 的候选排到最前（实体命中文档优先覆盖）
+        ranked.sort(key=lambda c: not c.get("entity_match", False))
 
-        # 2. 第一轮：贪心选入，受 max_per_doc 约束
+        # 2. 第一轮：文档覆盖优先 —— 每个不同文档先各取1个最高分代表
+        #    entity_match 文档因排序靠前，优先占据席位
         selected: List[Dict] = []
         doc_count: Dict[str, int] = {}
+        doc_seen: set = set()
         for c in ranked:
             if len(selected) >= top_k:
                 break
             fn = c.get("file_name", "")
-            if doc_count.get(fn, 0) >= max_per_doc:
+            if fn in doc_seen:
                 continue
             selected.append(c)
-            doc_count[fn] = doc_count.get(fn, 0) + 1
+            doc_count[fn] = 1
+            doc_seen.add(fn)
 
-        # 3. 不足 top_k 时回退：忽略 cap 补齐（保证信息量，宁可单文档多取）
+        # 3. 第二轮：在 max_per_doc 内按分数补齐（同一文档可再取，直到 cap）
+        if len(selected) < top_k:
+            for c in ranked:
+                if len(selected) >= top_k:
+                    break
+                fn = c.get("file_name", "")
+                if doc_count.get(fn, 0) >= max_per_doc:
+                    continue
+                if id(c) in {id(s) for s in selected}:
+                    continue
+                selected.append(c)
+                doc_count[fn] = doc_count.get(fn, 0) + 1
+
+        # 4. 仍不足 top_k：忽略 cap 补齐（保证信息量，宁可单文档多取）
         if len(selected) < top_k:
             sel_ids = {id(c) for c in selected}
             for c in ranked:
@@ -735,6 +757,9 @@ class RAGService:
                         candidates.append(c)
                     timing["entity_doc_expanded"] = len(entity_reps)
                     trace["entity_terms"] = entity_terms
+                marked = self._mark_entity_matched_chunks(candidates, entity_terms)
+                if marked:
+                    trace["entity_matched_chunks"] = marked
 
             # Step 5: 文档多样性选择 → primary
             if get_config().retrieval.enable_doc_diversity:
@@ -1198,11 +1223,28 @@ class RAGService:
                 result.append(t)
         return result[:3]
 
+    def _identify_entity_documents(self, entities: List[str]) -> set:
+        """
+        识别「实体命中文档」：name_match（文件名含实体）∪ BM25 top-3。
+        面试题等噪声文档即使 BM25 命中也不在此集合，避免挤掉真实文档。
+        """
+        entity_docs = set()
+        for entity in entities[:3]:
+            try:
+                results = self.es.search_keyword_only(entity, 15)
+                name_matched = {r.get("file_name") for r in results
+                                if entity in (r.get("file_name") or "")}
+                top3 = {r.get("file_name") for r in results[:3] if r.get("file_name")}
+                entity_docs |= name_matched | top3
+            except Exception:
+                continue
+        return entity_docs
+
     def _expand_entity_documents(self, entities: List[str],
                                   existing_candidates: List[Dict],
                                   top_k: int) -> List[Dict]:
         """
-        实体文档扩展：对每个实体做 BM25，把「包含实体但未进入候选池的文档」
+        实体文档扩展：对每个实体做 BM25，把「实体命中文档中未进入候选池的」
         各取一个代表 chunk 注入候选。
 
         解决场景：库里有两篇张成都的论文，问「张成都是谁」时向量检索只偏向
@@ -1210,12 +1252,16 @@ class RAGService:
         把第二篇的代表 chunk 注入候选，后续多样性选择自然让它进入 primary，
         LLM 即可合并两篇信息回答。
 
-        面试点：为什么每文档只取1个代表？
-        答：实体扩展的目的是「让该实体出现的每个文档都有机会被引用」，
-           每文档1个代表即可触发覆盖，不挤占 primary 名额；
-           后续 _diversify_by_document 会按分数与 cap 决定最终去留。
+        面试点：为什么只注入实体命中文档，而非所有 BM25 命中？
+        答：面试题文档常把「张成都」当示例提到，BM25 也会命中。若全注入，
+           面试题代表会挤掉真实论文。用 _identify_entity_documents 精准判定
+           （文件名含实体 或 BM25 top-3），只注入真实文档代表。
         """
         if not entities:
+            return []
+
+        entity_docs = self._identify_entity_documents(entities)
+        if not entity_docs:
             return []
 
         existing_docs = {c.get("file_name") for c in existing_candidates
@@ -1234,16 +1280,20 @@ class RAGService:
             for r in results:
                 fn = r.get("file_name")
                 cid = r.get("chunk_id")
-                if not fn or cid in existing_ids:
+                if not fn or fn not in entity_docs or cid in existing_ids:
                     continue
                 cur = reps_by_doc.get(fn)
                 if cur is None or r.get("score", 0) > cur.get("score", 0):
                     reps_by_doc[fn] = r
 
-        # 只注入「当前候选池里没有的文档」的代表
+        # 注入「候选池里没有的实体文档」的代表，并标记 entity_match
+        # 分数归一化到 RRF 量级（~0.04），避免 BM25 裸分压垮原有 RRF 排序
         reps = []
         for fn, rep in reps_by_doc.items():
             if fn not in existing_docs:
+                rep = dict(rep)
+                rep["entity_match"] = True
+                rep["score"] = 0.04
                 reps.append(rep)
                 existing_ids.add(rep.get("chunk_id"))
 
@@ -1252,6 +1302,26 @@ class RAGService:
                              "实体文档扩展注入",
                              entities=entities, new_docs=[r.get("file_name") for r in reps])
         return reps
+
+    def _mark_entity_matched_chunks(self, candidates: List[Dict],
+                                     entities: List[str]) -> int:
+        """
+        扫描候选池，对「实体命中文档」标记 entity_match=True。
+        复用 _identify_entity_documents 的判定（name_match ∪ BM25 top-3）。
+        返回标记的 chunk 数。
+        """
+        if not entities or not candidates:
+            return 0
+        entity_docs = self._identify_entity_documents(entities)
+        if not entity_docs:
+            return 0
+        marked = 0
+        for c in candidates:
+            if c.get("file_name") in entity_docs:
+                c["entity_match"] = True
+                marked += 1
+        return marked
+
 
     def _multi_entity_retrieve(self, question: str, terms: List[str],
                                 top_k: int) -> List[Dict]:

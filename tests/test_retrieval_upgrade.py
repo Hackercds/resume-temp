@@ -809,6 +809,25 @@ class TestDocumentDiversity:
         # rerank 高的 a_0 应排第一
         assert primary[0]["chunk_id"] == "a_0"
 
+    def test_entity_match_docs_prioritized_for_coverage(self):
+        """实体命中文档优先覆盖：即使 RRF 分数低，entity_match 文档先占席位"""
+        from internal.service.rag_service import RAGService
+        rag = RAGService.__new__(RAGService)
+        # 候选：5个不同文档，其中涉警/计算机/简历标记 entity_match
+        candidates = [
+            {"chunk_id": "面试_0", "file_name": "面试题.pdf", "chunk_index": 0, "score": 0.05},  # RRF最高
+            {"chunk_id": "涉警_0", "file_name": "涉警.pdf", "chunk_index": 0, "score": 0.03, "entity_match": True},
+            {"chunk_id": "计算机_0", "file_name": "计算机.pdf", "chunk_index": 0, "score": 0.02, "entity_match": True},
+            {"chunk_id": "简历_0", "file_name": "简历.pdf", "chunk_index": 0, "score": 0.04, "entity_match": True},
+            {"chunk_id": "amap_0", "file_name": "amap.pdf", "chunk_index": 0, "score": 0.01},
+        ]
+        primary = rag._diversify_by_document(candidates, top_k=4, max_per_doc=2)
+        # entity_match 文档应优先占席位（涉警、计算机、简历 + 面试题1个）
+        primary_docs = {c["file_name"] for c in primary}
+        assert "涉警.pdf" in primary_docs
+        assert "计算机.pdf" in primary_docs
+        assert "简历.pdf" in primary_docs
+
 
 # ==================== 内容预算 ====================
 class TestContextCharBudget:
@@ -1008,19 +1027,23 @@ class TestEntityDocumentExpansion:
         rag = RAGService.__new__(RAGService)
         rag.logger = MagicMock()
         rag.es = MagicMock()
-        # BM25「张成都」命中 3 个文档，其中 2 个不在候选池
+        # BM25「张成都」命中 3 个文档，文件名含「张成都」→ name_match 判定为实体文档
         rag.es.search_keyword_only.return_value = [
-            {"chunk_id": "涉警_0", "content": "张成都", "file_name": "涉警.pdf", "score": 3.0},
-            {"chunk_id": "计算机_0", "content": "作者张成都", "file_name": "计算机.pdf", "score": 2.8},
-            {"chunk_id": "简历_0", "content": "张成都简历", "file_name": "简历.pdf", "score": 2.5},
+            {"chunk_id": "涉警_0", "content": "张成都", "file_name": "涉警-张成都.pdf", "score": 3.0},
+            {"chunk_id": "计算机_0", "content": "作者张成都", "file_name": "4.张成都-计算机.pdf", "score": 2.8},
+            {"chunk_id": "简历_0", "content": "张成都简历", "file_name": "张成都-简历.pdf", "score": 2.5},
         ]
-        existing = [{"chunk_id": "涉警_0", "file_name": "涉警.pdf", "score": 0.4}]
+        existing = [{"chunk_id": "涉警_0", "file_name": "涉警-张成都.pdf", "score": 0.4}]
         reps = rag._expand_entity_documents(["张成都"], existing, top_k=3)
-        # 应注入计算机.pdf 和 简历.pdf（涉警已在候选）
+        # 应注入计算机和简历（涉警已在候选）
         new_docs = {r["file_name"] for r in reps}
-        assert "计算机.pdf" in new_docs
-        assert "简历.pdf" in new_docs
-        assert "涉警.pdf" not in new_docs
+        assert "4.张成都-计算机.pdf" in new_docs
+        assert "张成都-简历.pdf" in new_docs
+        assert "涉警-张成都.pdf" not in new_docs
+        # 注入的代表标记 entity_match 且分数归一化到 RRF 量级
+        for r in reps:
+            assert r.get("entity_match") is True
+            assert r["score"] == 0.04
 
     def test_expand_picks_highest_score_rep_per_doc(self):
         """同一文档多个命中 → 取分数最高的代表"""

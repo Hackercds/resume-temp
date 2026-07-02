@@ -1,5 +1,36 @@
 # CHANGELOG
 
+## [1.4.1] - 2026-07-02
+
+### 实体文档优先覆盖 + 流式渲染节流
+
+#### 问题诊断
+- 「张成都是谁」三篇相关文档（涉警论文、计算机论文、简历）仍有缺失：
+  - 注入的实体代表 chunk 用 BM25 裸分（5-7），压垮原有 RRF 分数（0.03）排序，
+    让面试题代表挤掉真实论文
+  - `_diversify_by_document` 按纯分数贪心，涉警论文5个 chunk 被 cap=2 后仍竞争不过面试题
+  - 面试题里 BM25 命中「张成都」（当示例引用），与真实论文难区分
+- 前端流式 token 快速到达时 Vue 响应式逐次 diff 长文本，累积卡顿表现为「后面一段突然全出」
+
+#### 修复
+- **实体文档精准识别** `_identify_entity_documents`：name_match（文件名含实体）∪ BM25 top-3，
+  排除面试题噪声。`_expand_entity_documents` 和 `_mark_entity_matched_chunks` 复用此判定
+- **注入代表分数归一化**：实体代表 score 设为 RRF 量级（0.04），靠 entity_match 标记优先，
+  不靠 BM25 裸分压垮排序
+- **多样性两阶段 + entity_match 优先**：`_diversify_by_document` 第一轮每个不同文档各取1代表，
+  entity_match 文档排序靠前优先占席位；第二轮 max_per_doc 内按分数补齐
+- **前端流式 rAF 节流**：token 累积到 buffer，requestAnimationFrame 每帧合并刷新一次，
+  避免逐 token 响应式 diff 长文本卡顿
+
+### Added
+- `rag_service._identify_entity_documents`、`_mark_entity_matched_chunks`
+- `_diversify_by_document` 两阶段覆盖优先 + entity_match 排序
+- 前端流式 rAF 节流（streamBuf + requestAnimationFrame）
+- 2 个专项测试：entity_match 优先覆盖、注入代表分数归一化
+
+### Tests
+- 全量 103 个测试通过（原 102 + 新增 1）
+
 ## [1.4.0] - 2026-07-02
 
 ### 实体文档扩展 + 前端流式渲染优化
