@@ -1,5 +1,43 @@
 # CHANGELOG
 
+## [1.4.0] - 2026-07-02
+
+### 实体文档扩展 + 前端流式渲染优化
+
+#### 问题诊断
+- 库里有两篇张成都的论文，问「张成都是谁」只提到一篇：向量检索偏向语义最相近的一篇，
+  第二篇论文没进入候选池；多实体分解要求≥2实体，「张成都是谁」只提取出1个实体不触发
+- 前端流式输出每 token 重新解析 Markdown，内容长了卡顿，表现为「首段后整段输出」
+- 「记住 Key」复选框在 API Key 列内使该列变高，输入框与预设模型/Provider/Model 不对齐
+- 眼睛按钮落在 1.2fr 宽列，占比过大
+
+#### 实体文档扩展（单实体多文档召回）
+- 新增 `_extract_entity_terms`：严格提取专有名词（人名/技术名/产品名），过滤普通名词（项目/总结/作者）
+- 新增 `_expand_entity_documents`：对核心实体做 BM25，把「包含实体但未进候选池的文档」
+  各取一个代表 chunk 注入候选。每文档取分数最高的代表，不挤占 primary 名额
+- query/query_stream Step 4.5 接入，单实体也触发（不要求≥2实体）
+- `_NON_ENTITY_WORDS` 过滤集：项目/经验/总结/可行性研究/大型语言模型 等泛称不扩展
+
+#### 前端流式渲染优化
+- 流式期间用纯文本+闪烁光标显示（`answer-streaming`），完成后切换到 Markdown 渲染
+- assistantMsg 增加 `streaming` 标志，done/error 时置 false
+- 避免每 token 调用 `renderMarkdown` 重新解析，消除「首段后整段输出」卡顿
+
+#### 前端配置区对齐修复
+- 「记住 Key」从 API Key 列内移出，作为独立行跨所有列（`grid-column: 1 / -1`）
+- config-card 网格改为 5 列 `1.6fr 1fr 1fr 1fr 40px`，眼睛按钮固定 40px 宽
+- 输入框与预设模型/Provider/Model 严格对齐（同一行同高）
+- 移动端适配同步更新
+
+### Added
+- `rag_service._extract_entity_terms`、`_expand_entity_documents`、`_NON_ENTITY_WORDS`
+- query/query_stream Step 4.5 实体文档扩展
+- 前端 `.answer-streaming`、`.stream-cursor` 光标动画 CSS
+- 5 个专项测试：实体过滤、新文档注入、代表选择、端到端单实体多文档召回
+
+### Tests
+- 全量 102 个测试通过（原 97 + 新增 5），无回归
+
 ## [1.3.0] - 2026-07-02
 
 ### 文档多样性策略升级（回答「同一文档该用多少内容 / 其他文档为何不能一次引用」）

@@ -987,3 +987,110 @@ class TestEndToEndMultiDocDiversity:
         assert len(source_docs) == 3
         assert result["trace"]["primary_count"] == 3
 
+
+# ==================== 实体文档扩展 ====================
+class TestEntityDocumentExpansion:
+    """单实体多文档召回：解决「张成都是谁」只召回一篇论文"""
+
+    def test_extract_entity_terms_filters_generic_words(self):
+        """普通名词（项目/总结）不当作实体"""
+        from internal.service.rag_service import RAGService
+        assert RAGService._extract_entity_terms("他的项目用了什么") == []
+        assert RAGService._extract_entity_terms("总结一下") == []
+        # 人名/技术名保留
+        assert "张成都" in RAGService._extract_entity_terms("张成都是谁")
+        assert "FastAPI" in RAGService._extract_entity_terms("FastAPI和Flask区别")
+
+    def test_expand_injects_new_docs(self):
+        """实体 BM25 命中候选池里没有的文档 → 注入代表 chunk"""
+        from internal.service.rag_service import RAGService
+        from unittest.mock import MagicMock
+        rag = RAGService.__new__(RAGService)
+        rag.logger = MagicMock()
+        rag.es = MagicMock()
+        # BM25「张成都」命中 3 个文档，其中 2 个不在候选池
+        rag.es.search_keyword_only.return_value = [
+            {"chunk_id": "涉警_0", "content": "张成都", "file_name": "涉警.pdf", "score": 3.0},
+            {"chunk_id": "计算机_0", "content": "作者张成都", "file_name": "计算机.pdf", "score": 2.8},
+            {"chunk_id": "简历_0", "content": "张成都简历", "file_name": "简历.pdf", "score": 2.5},
+        ]
+        existing = [{"chunk_id": "涉警_0", "file_name": "涉警.pdf", "score": 0.4}]
+        reps = rag._expand_entity_documents(["张成都"], existing, top_k=3)
+        # 应注入计算机.pdf 和 简历.pdf（涉警已在候选）
+        new_docs = {r["file_name"] for r in reps}
+        assert "计算机.pdf" in new_docs
+        assert "简历.pdf" in new_docs
+        assert "涉警.pdf" not in new_docs
+
+    def test_expand_picks_highest_score_rep_per_doc(self):
+        """同一文档多个命中 → 取分数最高的代表"""
+        from internal.service.rag_service import RAGService
+        from unittest.mock import MagicMock
+        rag = RAGService.__new__(RAGService)
+        rag.logger = MagicMock()
+        rag.es = MagicMock()
+        rag.es.search_keyword_only.return_value = [
+            {"chunk_id": "a_0", "content": "x", "file_name": "a.pdf", "score": 1.0},
+            {"chunk_id": "a_1", "content": "y", "file_name": "a.pdf", "score": 5.0},
+        ]
+        reps = rag._expand_entity_documents(["张三"], [], top_k=3)
+        assert len(reps) == 1
+        assert reps[0]["chunk_id"] == "a_1"  # 分数高的
+
+    def test_expand_no_entities_returns_empty(self):
+        """无实体 → 不扩展"""
+        from internal.service.rag_service import RAGService
+        from unittest.mock import MagicMock
+        rag = RAGService.__new__(RAGService)
+        rag.logger = MagicMock()
+        rag.es = MagicMock()
+        assert rag._expand_entity_documents([], [{"file_name": "a.pdf"}], 3) == []
+
+    @patch('internal.service.rag_service.EmbeddingService')
+    @patch('internal.service.rag_service.ESService')
+    @patch('internal.service.rag_service.LLMService')
+    def test_single_entity_query_recalls_multiple_docs(self, mock_llm, mock_es, mock_emb):
+        """端到端：「张成都是谁」应让两篇论文都进入 sources"""
+        import numpy as np
+        from internal.service.rag_service import RAGService
+
+        mock_emb_instance = MagicMock()
+        mock_emb_instance.encode_query.return_value = np.random.randn(512).astype(np.float32)
+        mock_emb.return_value = mock_emb_instance
+
+        mock_es_instance = MagicMock()
+        # 向量检索只偏向涉警那篇
+        mock_es_instance.search_hybrid.return_value = [
+            {"chunk_id": "涉警_0", "content": "张成都涉警论文", "file_name": "涉警.pdf",
+             "chunk_index": 0, "score": 0.4},
+        ]
+        # BM25「张成都」命中两篇论文
+        def kw_only(query, size=10, **kw):
+            if "张成都" in query:
+                return [
+                    {"chunk_id": "涉警_0", "content": "张成都", "file_name": "涉警.pdf", "score": 3.0},
+                    {"chunk_id": "计算机_0", "content": "作者张成都", "file_name": "计算机.pdf", "score": 2.8},
+                ]
+            return []
+        mock_es_instance.search_keyword_only.side_effect = kw_only
+        mock_es_instance.expand_neighbors.side_effect = lambda c, **kw: c
+        mock_es_instance.list_file_names.return_value = []
+        mock_es.return_value = mock_es_instance
+
+        mock_llm_instance = MagicMock()
+        mock_llm_instance.generate.return_value = "答案"
+        mock_llm.return_value = mock_llm_instance
+
+        rag = RAGService(embedding_service=mock_emb_instance,
+                         es_service=mock_es_instance, llm_service=mock_llm_instance)
+        result = rag.query(question="张成都是谁", api_key="sk-test", top_k=3)
+
+        # 两篇论文都应在 sources 里（实体扩展注入了第二篇）
+        source_docs = {s["file_name"] for s in result["sources"]}
+        assert "涉警.pdf" in source_docs
+        assert "计算机.pdf" in source_docs
+        # trace 记录实体扩展
+        assert result["timing"].get("entity_doc_expanded") == 1
+        assert result["trace"].get("entity_terms") == ["张成都"]
+
+

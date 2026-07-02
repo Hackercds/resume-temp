@@ -145,11 +145,6 @@ app.component('api-key-config', {
                 :value="apiConfig.apiKey" @input="update('apiKey', $event.target.value)"
                 :placeholder="defaultApiKeyConfigured ? '已由后端配置默认 Key' : 'sk-...'"
                 :disabled="defaultApiKeyConfigured && apiConfig.apiKey === 'DEFAULT_API_KEY'" />
-            <label class="remember-row">
-                <input type="checkbox" :checked="rememberKey"
-                    @change="$emit('update:rememberKey', $event.target.checked)" />
-                记住 Key
-            </label>
         </div>
         <div>
             <label>预设模型</label>
@@ -177,6 +172,11 @@ app.component('api-key-config', {
         <button class="eye-btn" @click="showKey = !showKey" :title="showKey ? '隐藏' : '显示'">
             {{ showKey ? '🙈' : '👁' }}
         </button>
+        <label class="remember-row">
+            <input type="checkbox" :checked="rememberKey"
+                @change="$emit('update:rememberKey', $event.target.checked)" />
+            记住 Key
+        </label>
     </div>
     `,
     data() { return { showKey: false }; },
@@ -221,7 +221,9 @@ app.component('chat-panel', {
                     <div class="bubble">
                         <div v-if="msg.role === 'user'">{{ msg.content }}</div>
                         <div v-else>
-                            <div class="answer-box" v-html="renderMarkdown(msg.content)"></div>
+                            <!-- 流式期间用纯文本+光标，避免每 token 重新解析 Markdown 导致卡顿 -->
+                            <div v-if="msg.streaming" class="answer-box answer-streaming">{{ msg.content }}<span class="stream-cursor">▋</span></div>
+                            <div v-else class="answer-box" v-html="renderMarkdown(msg.content)"></div>
                             <div v-if="msg.timing" class="bubble-meta">
                                 <span><b>{{ msg.timing.embedding_ms }}ms</b> embed</span>
                                 <span><b>{{ msg.timing.search_ms }}ms</b> search</span>
@@ -431,6 +433,7 @@ app.component('chat-panel', {
                 trace: null,
                 showTrace: false,
                 fullDocs: [],
+                streaming: true,  // 流式期间用纯文本显示，完成后渲染 Markdown
                 timestamp: Date.now()
             };
             this.messages.push(assistantMsg);
@@ -461,6 +464,7 @@ app.component('chat-panel', {
                         assistantMsg.timing = data.timing || null;
                         assistantMsg.trace_id = data.trace_id || '';
                         assistantMsg.trace = data.trace || null;
+                        assistantMsg.streaming = false;  // 完成后切换到 Markdown 渲染
                         this.followUpQuestions = this._generateFollowUpQuestions(data.sources || []);
                         this.saveSession();
                     },
@@ -469,6 +473,7 @@ app.component('chat-panel', {
                         this.errorSuggestion = err.suggestion || '';
                         this.emptyRetrieval = !!err.emptyRetrieval;
                         this.errorRetryable = !this.emptyRetrieval;
+                        assistantMsg.streaming = false;
                         const idx = this.messages.findIndex(m => m.id === assistantMsg.id);
                         if (idx >= 0) this.messages.splice(idx, 1);
                         this.$emit('notify', err.message, 'error');
@@ -479,6 +484,7 @@ app.component('chat-panel', {
                 this.errorSuggestion = e.suggestion || '';
                 this.emptyRetrieval = !!e.emptyRetrieval;
                 this.errorRetryable = !this.emptyRetrieval;
+                assistantMsg.streaming = false;
                 const idx = this.messages.findIndex(m => m.id === assistantMsg.id);
                 if (idx >= 0) this.messages.splice(idx, 1);
                 this.$emit('notify', e.message, 'error');
@@ -534,6 +540,7 @@ app.component('chat-panel', {
                     fullDocs: [],
                     isFullDoc: true,
                     targetFile: fileName,
+                    streaming: true,
                     timestamp: Date.now()
                 };
                 this.messages.splice(idx + 1, 0, fullDocMsg);
@@ -563,15 +570,18 @@ app.component('chat-panel', {
                             fullDocMsg.timing = data.timing || null;
                             fullDocMsg.trace_id = data.trace_id || '';
                             fullDocMsg.trace = data.trace || null;
+                            fullDocMsg.streaming = false;
                             this.saveSession();
                         },
                         (err) => {
                             fullDocMsg.content = `⚠ ${err.message}`;
+                            fullDocMsg.streaming = false;
                             this.$emit('notify', err.message, 'error');
                         }
                     );
                 } catch (e) {
                     fullDocMsg.content = `⚠ ${e.message}`;
+                    fullDocMsg.streaming = false;
                     this.$emit('notify', e.message, 'error');
                 }
             }

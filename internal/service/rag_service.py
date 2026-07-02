@@ -326,6 +326,19 @@ class RAGService:
                         timing["decomposed"] = True
                         timing["decomposed_count"] = len(decomposed)
 
+            # Step 4.5: 实体文档扩展（单实体也触发）
+            # 解决「张成都是谁」只召回一篇论文：对核心实体做 BM25，
+            # 把包含实体但未进候选池的文档代表 chunk 注入，确保多文档覆盖
+            entity_terms = self._extract_entity_terms(expanded_question)
+            if entity_terms:
+                entity_reps = self._expand_entity_documents(
+                    entity_terms, candidates, top_k)
+                if entity_reps:
+                    for c in entity_reps:
+                        candidates.append(c)
+                    timing["entity_doc_expanded"] = len(entity_reps)
+                    trace["entity_terms"] = entity_terms
+
             # Step 5: 文档多样性选择 → primary（回答「其他文档为什么不能一次引用」）
             # 单文档 cap + MMR 贪心，确保 top_k 覆盖多文档
             if get_config().retrieval.enable_doc_diversity:
@@ -712,6 +725,17 @@ class RAGService:
                         timing["decomposed"] = True
                         timing["decomposed_count"] = len(decomposed)
 
+            # Step 4.5: 实体文档扩展（单实体也触发）
+            entity_terms = self._extract_entity_terms(expanded_question)
+            if entity_terms:
+                entity_reps = self._expand_entity_documents(
+                    entity_terms, candidates, top_k)
+                if entity_reps:
+                    for c in entity_reps:
+                        candidates.append(c)
+                    timing["entity_doc_expanded"] = len(entity_reps)
+                    trace["entity_terms"] = entity_terms
+
             # Step 5: 文档多样性选择 → primary
             if get_config().retrieval.enable_doc_diversity:
                 primary = self._diversify_by_document(
@@ -1062,6 +1086,27 @@ class RAGService:
         '一下', '一点', '一些', '出来', '起来', '过来',
     }
 
+    # 非实体词：实体文档扩展时排除普通名词/动词/泛称，避免对"项目""总结"做无意义 BM25
+    # 仅保留专有名词（人名、技术名、产品名、机构名等）
+    _NON_ENTITY_WORDS = {
+        '项目', '经验', '能力', '技术', '内容', '信息', '问题', '情况',
+        '方面', '方法', '方式', '结果', '结论', '建议', '方案', '策略',
+        '特点', '特征', '优势', '劣势', '原理', '流程', '步骤', '阶段',
+        '总结', '概括', '归纳', '分析', '介绍', '说明', '解释', '展开',
+        '详情', '详细', '概况', '简介', '背景', '现状', '发展', '趋势',
+        '区别', '不同', '相同', '相似', '关联', '联系', '影响', '作用',
+        '价值', '意义', '目的', '目标', '需求', '场景', '应用', '实现',
+        '设计', '架构', '结构', '组成', '模块', '功能', '性能', '指标',
+        '评估', '评价', '测试', '验证', '检验', '检测', '预测', '评估者',
+        '研究', '可行性', '论文', '文章', '文档', '资料', '数据', '代码',
+        '系统', '平台', '工具', '框架', '模型', '算法', '接口', '服务',
+        '谁', '哪', '什么', '怎么', '如何', '为何', '为什么', '多少',
+        '人是', '写的', '作者', '名字', '身份', '简历',
+        '总结一下', '总结', '概括', '归纳', '可行性研究', '可行性',
+        '谁写', '谁写的', '是谁', '是什么', '怎么样', '怎样',
+        '大型语言模型', '语言模型', '深度学习', '机器学习',
+    }
+
     @staticmethod
     def _extract_entities(question: str) -> List[str]:
         """
@@ -1122,6 +1167,91 @@ class RAGService:
                 seen.add(t)
                 result.append(t)
         return result[:5]
+
+    @staticmethod
+    def _extract_entity_terms(question: str) -> List[str]:
+        """
+        提取专有名词用于实体文档扩展（比 _extract_entities 更严格）。
+        排除普通名词/动词/泛称（如「项目」「总结」「作者」），只保留人名、技术名、产品名等。
+        面试点：为什么实体扩展要严格过滤？
+        答：实体扩展会对每个实体做一次 BM25，若把「项目」「内容」当实体，
+           会召回大量无关文档，反而稀释结果。只有专有名词才值得跨文档召回。
+        规则：在 _extract_entities 基础上，再过滤 _NON_ENTITY_WORDS；
+        另外专有名词通常含大写英文或长度≥3 的中文专名，用启发式筛选。
+        """
+        raw = RAGService._extract_entities(question)
+        non_entity = RAGService._NON_ENTITY_WORDS
+        import re
+        result = []
+        for t in raw:
+            if t in non_entity:
+                continue
+            # 纯中文专名：长度≥2 且非泛称；含英文/数字的专有名词（FastAPI、Redis）直接保留
+            has_cjk = bool(re.search(r'[一-龥]', t))
+            has_ascii = bool(re.search(r'[A-Za-z]', t))
+            has_digit = bool(re.search(r'[0-9]', t))
+            if has_ascii or has_digit:
+                result.append(t)  # 技术名/版本号直接保留
+            elif has_cjk and len(t) >= 2:
+                # 中文：排除"是""谁"等已被 _STOP_WORDS 过滤的，这里二次保险
+                # 人名通常2-4字，技术中文名也常2-4字
+                result.append(t)
+        return result[:3]
+
+    def _expand_entity_documents(self, entities: List[str],
+                                  existing_candidates: List[Dict],
+                                  top_k: int) -> List[Dict]:
+        """
+        实体文档扩展：对每个实体做 BM25，把「包含实体但未进入候选池的文档」
+        各取一个代表 chunk 注入候选。
+
+        解决场景：库里有两篇张成都的论文，问「张成都是谁」时向量检索只偏向
+        语义相近的一篇，另一篇没进候选。对「张成都」做 BM25 能命中两篇论文，
+        把第二篇的代表 chunk 注入候选，后续多样性选择自然让它进入 primary，
+        LLM 即可合并两篇信息回答。
+
+        面试点：为什么每文档只取1个代表？
+        答：实体扩展的目的是「让该实体出现的每个文档都有机会被引用」，
+           每文档1个代表即可触发覆盖，不挤占 primary 名额；
+           后续 _diversify_by_document 会按分数与 cap 决定最终去留。
+        """
+        if not entities:
+            return []
+
+        existing_docs = {c.get("file_name") for c in existing_candidates
+                         if c.get("file_name")}
+        existing_ids = {c.get("chunk_id") for c in existing_candidates}
+        # 每文档保留分数最高的代表
+        reps_by_doc: Dict[str, Dict] = {}
+
+        for entity in entities[:3]:
+            try:
+                results = self.es.search_keyword_only(entity, max(top_k * 3, 15))
+            except Exception as e:
+                self.logger.warn("entity_expand", "rag_service",
+                                 f"实体 BM25 失败", entity=entity, error=str(e)[:100])
+                continue
+            for r in results:
+                fn = r.get("file_name")
+                cid = r.get("chunk_id")
+                if not fn or cid in existing_ids:
+                    continue
+                cur = reps_by_doc.get(fn)
+                if cur is None or r.get("score", 0) > cur.get("score", 0):
+                    reps_by_doc[fn] = r
+
+        # 只注入「当前候选池里没有的文档」的代表
+        reps = []
+        for fn, rep in reps_by_doc.items():
+            if fn not in existing_docs:
+                reps.append(rep)
+                existing_ids.add(rep.get("chunk_id"))
+
+        if reps:
+            self.logger.info("entity_expand", "rag_service",
+                             "实体文档扩展注入",
+                             entities=entities, new_docs=[r.get("file_name") for r in reps])
+        return reps
 
     def _multi_entity_retrieve(self, question: str, terms: List[str],
                                 top_k: int) -> List[Dict]:
