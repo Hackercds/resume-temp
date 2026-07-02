@@ -40,7 +40,14 @@ class APIResponse(BaseModel):
 
 # ---------- 查询请求 ----------
 class ChatMessage(BaseModel):
-    """对话历史消息"""
+    """对话历史消息
+
+    历史透传：后端不重组历史，前端把全字段（含 sources、fullDocs 等）
+    一起带过来；不识别的字段额外允许（model_config extra='allow'），
+    避免丢字段导致历史 source boost、指代消解等下游功能失效。
+    面试点：前端是"真相之源"，后端做 best-effort 透传即可。
+    """
+    model_config = {"extra": "allow"}
     role: str = Field(..., pattern=r"^(user|assistant|system)$",
                       description="消息角色: user / assistant / system")
     content: str = Field(..., min_length=1, description="消息内容")

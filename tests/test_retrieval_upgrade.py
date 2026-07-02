@@ -1460,3 +1460,75 @@ class TestFullDocumentReconstructionFallback:
         repo._get_agg_field = MagicMock(return_value="file_name")
 
         assert repo.get_full_document("不存在.pdf") is None
+
+
+class TestChatMessageSourcesTransparency:
+    """面试点：历史 assistant 消息必须把 sources 透传到下游；
+    否则历史 source boost、指代消解等全部失效——表现为「多轮对话记忆丢失」。
+    前端是真相之源，ChatMessage 用 extra='allow' 让任意字段透传。"""
+
+    def test_chat_message_preserves_sources(self):
+        from internal.model.dto import ChatMessage
+        msg = ChatMessage(role="assistant", content="答案",
+                         sources=[{"file_name": "a.pdf", "score": 0.9}])
+        # sources 必须存在且不丢字段
+        assert hasattr(msg, "sources")
+        assert msg.sources[0]["file_name"] == "a.pdf"
+
+    def test_chat_message_preserves_extra_fields(self):
+        from internal.model.dto import ChatMessage
+        msg = ChatMessage(role="assistant", content="x",
+                         fullDocs=[{"file_name": "a.pdf", "content": "全文"}],
+                         arbitrary_meta={"k": 1})
+        assert msg.model_dump()["fullDocs"][0]["content"] == "全文"
+        assert msg.model_dump()["arbitrary_meta"]["k"] == 1
+
+
+class TestHistoricalSourceBoostActive:
+    """历史中提过的 file_name 应在本轮召回里被加权。
+    之前因为 ChatMessage 没透传 sources，file_weights 永远是空，boost 没生效。"""
+
+    def _make_service(self):
+        from internal.service.rag_service import RAGService
+        svc = RAGService.__new__(RAGService)
+        svc.logger = MagicMock()
+        return svc
+
+    def test_build_historical_file_weights_counts_and_recency(self):
+        svc = self._make_service()
+        history = [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1",
+             "sources": [{"file_name": "a.pdf"}, {"file_name": "b.pdf"}]},
+            {"role": "user", "content": "q2"},
+            {"role": "assistant", "content": "a2",
+             "sources": [{"file_name": "a.pdf"}]},
+        ]
+        fw = svc._build_historical_file_weights(history)
+        assert fw["a.pdf"]["count"] == 2  # 在两轮都出现过
+        assert fw["b.pdf"]["count"] == 1
+        assert fw["a.pdf"]["recency"] == 1  # 最近一轮
+
+    def test_boost_adds_to_score_for_known_files(self):
+        svc = self._make_service()
+        history = [
+            {"role": "assistant", "content": "a",
+             "sources": [{"file_name": "a.pdf"}]},
+        ]
+        candidates = [
+            {"file_name": "a.pdf", "score": 0.5},
+            {"file_name": "b.pdf", "score": 0.5},
+        ]
+        out = svc._boost_historical_sources(candidates, history, boost=0.15)
+        a = next(c for c in out if c["file_name"] == "a.pdf")
+        b = next(c for c in out if c["file_name"] == "b.pdf")
+        assert a["score"] > b["score"]  # a 加权后更高
+        assert "source_boost" in a
+        assert a["source_boost"] > 0
+
+    def test_boost_no_op_without_history(self):
+        svc = self._make_service()
+        candidates = [{"file_name": "a.pdf", "score": 0.5}]
+        out = svc._boost_historical_sources(candidates, [], boost=0.15)
+        assert out[0]["score"] == 0.5  # 没分加
+        assert "source_boost" not in out[0]
