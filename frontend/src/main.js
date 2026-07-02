@@ -451,19 +451,27 @@ app.component('chat-panel', {
                 };
                 if (this.apiConfig.baseUrl) body.base_url = this.apiConfig.baseUrl;
 
-                // 流式 token 累积 + requestAnimationFrame 节流渲染
-                // 面试点：为什么节流？多个 token 快速到达时，Vue 对长文本的响应式
-                // 更新会逐次 diff 整个文本节点，累积卡顿表现为「后面一段突然全出」。
-                // rAF 合并到每帧一次刷新，流式输出更顺滑。
+                // 流式 token 累积 + requestAnimationFrame 节流 + 每帧限量释放
+                // 面试点：为什么每帧限量？
+                // 答：当 LLM/代理把后续内容攒成一个大 chunk 批量发来时，streamBuf
+                // 会堆积大量字符，一次刷新全部追加表现为「整段一下出现」。
+                // 每帧只释放 CHARS_PER_FRAME 个字符，剩余留到下一帧，保证均匀流式
+                // （打字机效果）。token 慢到达时 buffer 小，限量不影响；快到达时均匀分帧。
                 let streamBuf = '';
-                let rafScheduled = false;
+                let rafId = null;
+                const CHARS_PER_FRAME = 8;  // 每帧最多追加字符数，约480字/分，可看清流式
                 const flushStream = () => {
-                    rafScheduled = false;
+                    rafId = null;
                     if (streamBuf) {
-                        assistantMsg.content += streamBuf;
-                        streamBuf = '';
+                        const chunk = streamBuf.slice(0, CHARS_PER_FRAME);
+                        streamBuf = streamBuf.slice(CHARS_PER_FRAME);
+                        assistantMsg.content += chunk;
                         this.statusText = '生成中';
                         this.scrollToBottom();
+                        // 还有剩余 → 调度下一帧继续释放
+                        if (streamBuf) {
+                            rafId = requestAnimationFrame(flushStream);
+                        }
                     }
                 };
 
@@ -471,15 +479,13 @@ app.component('chat-panel', {
                     body,
                     (token) => {
                         streamBuf += token;
-                        if (!rafScheduled) {
-                            rafScheduled = true;
-                            requestAnimationFrame(flushStream);
+                        if (rafId === null) {
+                            rafId = requestAnimationFrame(flushStream);
                         }
                     },
                     (data) => {
-                        // done 前最后刷一次，确保 buffer 内容进 content
-                        if (rafScheduled) cancelAnimationFrame(rafScheduled);
-                        rafScheduled = false;
+                        // done 前取消节流，把剩余全部 flush（不限量），保证最终完整
+                        if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; }
                         if (streamBuf) { assistantMsg.content += streamBuf; streamBuf = ''; }
                         assistantMsg.content = data.answer || assistantMsg.content;
                         assistantMsg.sources = data.sources || [];
@@ -491,6 +497,7 @@ app.component('chat-panel', {
                         this.saveSession();
                     },
                     (err) => {
+                        if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; }
                         this.error = err.message;
                         this.errorSuggestion = err.suggestion || '';
                         this.emptyRetrieval = !!err.emptyRetrieval;
@@ -580,13 +587,29 @@ app.component('chat-panel', {
                     };
                     if (this.apiConfig.baseUrl) body.base_url = this.apiConfig.baseUrl;
 
+                    // 流式节流 + 每帧限量释放（同 doQuery，避免整段一下出现）
+                    let fdBuf = '';
+                    let fdRafId = null;
+                    const FD_CHARS_PER_FRAME = 8;
+                    const flushFd = () => {
+                        fdRafId = null;
+                        if (fdBuf) {
+                            fullDocMsg.content += fdBuf.slice(0, FD_CHARS_PER_FRAME);
+                            fdBuf = fdBuf.slice(FD_CHARS_PER_FRAME);
+                            this.scrollToBottom();
+                            if (fdBuf) { fdRafId = requestAnimationFrame(flushFd); }
+                        }
+                    };
+
                     await ApiClient.queryStream(
                         body,
                         (token) => {
-                            fullDocMsg.content += token;
-                            this.scrollToBottom();
+                            fdBuf += token;
+                            if (fdRafId === null) { fdRafId = requestAnimationFrame(flushFd); }
                         },
                         (data) => {
+                            if (fdRafId !== null) { cancelAnimationFrame(fdRafId); fdRafId = null; }
+                            if (fdBuf) { fullDocMsg.content += fdBuf; fdBuf = ''; }
                             fullDocMsg.content = data.answer || fullDocMsg.content;
                             fullDocMsg.sources = data.sources || [];
                             fullDocMsg.timing = data.timing || null;
@@ -596,6 +619,7 @@ app.component('chat-panel', {
                             this.saveSession();
                         },
                         (err) => {
+                            if (fdRafId !== null) { cancelAnimationFrame(fdRafId); fdRafId = null; }
                             fullDocMsg.content = `⚠ ${err.message}`;
                             fullDocMsg.streaming = false;
                             this.$emit('notify', err.message, 'error');
