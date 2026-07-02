@@ -828,6 +828,27 @@ class TestDocumentDiversity:
         assert "计算机.pdf" in primary_docs
         assert "简历.pdf" in primary_docs
 
+    def test_entity_chunk_preferred_over_higher_score(self):
+        """entity_match 文档优先选 entity_chunk（含实体词），而非更高分的非实体chunk"""
+        from internal.service.rag_service import RAGService
+        rag = RAGService.__new__(RAGService)
+        # 涉警论文有两个 chunk：#20 案例分数高但不含实体，#0 作者页含实体
+        candidates = [
+            {"chunk_id": "涉警_20", "file_name": "涉警.pdf", "chunk_index": 20,
+             "score": 0.398, "entity_match": True},  # 案例页，不含张成都
+            {"chunk_id": "涉警_0", "file_name": "涉警.pdf", "chunk_index": 0,
+             "score": 0.341, "entity_match": True, "entity_chunk": True},  # 作者页，含张成都
+            {"chunk_id": "简历_0", "file_name": "简历.pdf", "chunk_index": 0,
+             "score": 0.04, "entity_match": True, "entity_chunk": True},
+            {"chunk_id": "计算机_0", "file_name": "计算机.pdf", "chunk_index": 0,
+             "score": 0.04, "entity_match": True, "entity_chunk": True},
+        ]
+        primary = rag._diversify_by_document(candidates, top_k=4, max_per_doc=2)
+        涉警 = [c for c in primary if c["file_name"] == "涉警.pdf"]
+        assert len(涉警) >= 1
+        # 应选 #0（entity_chunk）而非 #20（案例）
+        assert 涉警[0]["chunk_index"] == 0
+
 
 # ==================== 内容预算 ====================
 class TestContextCharBudget:

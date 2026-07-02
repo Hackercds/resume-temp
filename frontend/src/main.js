@@ -451,27 +451,53 @@ app.component('chat-panel', {
                 };
                 if (this.apiConfig.baseUrl) body.base_url = this.apiConfig.baseUrl;
 
-                // 流式 token 累积 + requestAnimationFrame 节流 + 每帧限量释放
-                // 面试点：为什么每帧限量？
-                // 答：当 LLM/代理把后续内容攒成一个大 chunk 批量发来时，streamBuf
-                // 会堆积大量字符，一次刷新全部追加表现为「整段一下出现」。
-                // 每帧只释放 CHARS_PER_FRAME 个字符，剩余留到下一帧，保证均匀流式
-                // （打字机效果）。token 慢到达时 buffer 小，限量不影响；快到达时均匀分帧。
+                // 流式 token 累积 + requestAnimationFrame 每帧限量释放（打字机效果）
+                // 面试点：为什么 done 也要限量释放？
+                // 答：后端流式可能只发了首句（reasoning 模型思考阶段/SSE 中断），
+                // done 事件的 data.answer 带完整答案。若一次性覆盖 content + streaming=false，
+                // 剩余内容瞬间全出（表现为「先一句流式，后面整段出现」）。
+                // 把 answer 与已释放内容的差异放入 streamBuf，继续每帧限量释放，
+                // 释放完才 streaming=false 切 Markdown，全程均匀流式。
                 let streamBuf = '';
                 let rafId = null;
-                const CHARS_PER_FRAME = 8;  // 每帧最多追加字符数，约480字/分，可看清流式
-                const flushStream = () => {
+                const CHARS_PER_FRAME = 8;  // 每帧最多追加字符数，约480字/分
+                const flushFrame = () => {
                     rafId = null;
+                    if (!streamBuf) return;
+                    const piece = streamBuf.slice(0, CHARS_PER_FRAME);
+                    streamBuf = streamBuf.slice(CHARS_PER_FRAME);
+                    assistantMsg.content += piece;
+                    this.statusText = '生成中';
+                    this.scrollToBottom();
                     if (streamBuf) {
-                        const chunk = streamBuf.slice(0, CHARS_PER_FRAME);
-                        streamBuf = streamBuf.slice(CHARS_PER_FRAME);
-                        assistantMsg.content += chunk;
-                        this.statusText = '生成中';
-                        this.scrollToBottom();
-                        // 还有剩余 → 调度下一帧继续释放
+                        rafId = requestAnimationFrame(flushFrame);
+                    }
+                };
+                // done 后的收尾释放：释放完 streamBuf 再切 Markdown
+                const finishAfterFlush = (data) => {
+                    assistantMsg.sources = data.sources || [];
+                    assistantMsg.timing = data.timing || null;
+                    assistantMsg.trace_id = data.trace_id || '';
+                    assistantMsg.trace = data.trace || null;
+                    this.followUpQuestions = this._generateFollowUpQuestions(data.sources || []);
+                    this.saveSession();
+                    // 若还有 buffer 未释放，继续限量释放，释放完再切 Markdown
+                    const finishTick = () => {
+                        rafId = null;
                         if (streamBuf) {
-                            rafId = requestAnimationFrame(flushStream);
+                            const piece = streamBuf.slice(0, CHARS_PER_FRAME);
+                            streamBuf = streamBuf.slice(CHARS_PER_FRAME);
+                            assistantMsg.content += piece;
+                            this.scrollToBottom();
+                            rafId = requestAnimationFrame(finishTick);
+                        } else {
+                            assistantMsg.streaming = false;  // 全部释放完，切 Markdown 渲染
                         }
+                    };
+                    if (streamBuf) {
+                        rafId = requestAnimationFrame(finishTick);
+                    } else {
+                        assistantMsg.streaming = false;
                     }
                 };
 
@@ -480,21 +506,31 @@ app.component('chat-panel', {
                     (token) => {
                         streamBuf += token;
                         if (rafId === null) {
-                            rafId = requestAnimationFrame(flushStream);
+                            rafId = requestAnimationFrame(flushFrame);
                         }
                     },
                     (data) => {
-                        // done 前取消节流，把剩余全部 flush（不限量），保证最终完整
+                        // done：取消当前 rAF，把 answer 差异补入 streamBuf 继续限量释放
                         if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; }
-                        if (streamBuf) { assistantMsg.content += streamBuf; streamBuf = ''; }
-                        assistantMsg.content = data.answer || assistantMsg.content;
-                        assistantMsg.sources = data.sources || [];
-                        assistantMsg.timing = data.timing || null;
-                        assistantMsg.trace_id = data.trace_id || '';
-                        assistantMsg.trace = data.trace || null;
-                        assistantMsg.streaming = false;  // 完成后切换到 Markdown 渲染
-                        this.followUpQuestions = this._generateFollowUpQuestions(data.sources || []);
-                        this.saveSession();
+                        const fullAnswer = data.answer || '';
+                        const released = assistantMsg.content;  // 已释放到 content 的部分
+                        const pending = streamBuf;  // 待释放部分
+                        const streamedTotal = released + pending;
+                        if (fullAnswer === streamedTotal) {
+                            // 流式完整，继续释放 pending
+                            // streamBuf 已是 pending，无需改动
+                        } else if (fullAnswer.startsWith(streamedTotal)) {
+                            // answer 多了尾部，把差异追加到 streamBuf
+                            streamBuf = pending + fullAnswer.slice(streamedTotal.length);
+                        } else if (fullAnswer && !streamedTotal) {
+                            // 流式期间完全没收到 token，整个 answer 走限量释放
+                            streamBuf = fullAnswer;
+                        } else {
+                            // 不一致（后端重写），用 answer 重新释放
+                            assistantMsg.content = '';
+                            streamBuf = fullAnswer;
+                        }
+                        finishAfterFlush(data);
                     },
                     (err) => {
                         if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; }
@@ -587,18 +623,37 @@ app.component('chat-panel', {
                     };
                     if (this.apiConfig.baseUrl) body.base_url = this.apiConfig.baseUrl;
 
-                    // 流式节流 + 每帧限量释放（同 doQuery，避免整段一下出现）
+                    // 流式节流 + 每帧限量释放 + done 走限量收尾（同 doQuery）
                     let fdBuf = '';
                     let fdRafId = null;
                     const FD_CHARS_PER_FRAME = 8;
                     const flushFd = () => {
                         fdRafId = null;
-                        if (fdBuf) {
-                            fullDocMsg.content += fdBuf.slice(0, FD_CHARS_PER_FRAME);
-                            fdBuf = fdBuf.slice(FD_CHARS_PER_FRAME);
-                            this.scrollToBottom();
-                            if (fdBuf) { fdRafId = requestAnimationFrame(flushFd); }
-                        }
+                        if (!fdBuf) return;
+                        fullDocMsg.content += fdBuf.slice(0, FD_CHARS_PER_FRAME);
+                        fdBuf = fdBuf.slice(FD_CHARS_PER_FRAME);
+                        this.scrollToBottom();
+                        if (fdBuf) { fdRafId = requestAnimationFrame(flushFd); }
+                    };
+                    const finishFd = (data) => {
+                        fullDocMsg.sources = data.sources || [];
+                        fullDocMsg.timing = data.timing || null;
+                        fullDocMsg.trace_id = data.trace_id || '';
+                        fullDocMsg.trace = data.trace || null;
+                        this.saveSession();
+                        const tick = () => {
+                            fdRafId = null;
+                            if (fdBuf) {
+                                fullDocMsg.content += fdBuf.slice(0, FD_CHARS_PER_FRAME);
+                                fdBuf = fdBuf.slice(FD_CHARS_PER_FRAME);
+                                this.scrollToBottom();
+                                fdRafId = requestAnimationFrame(tick);
+                            } else {
+                                fullDocMsg.streaming = false;
+                            }
+                        };
+                        if (fdBuf) { fdRafId = requestAnimationFrame(tick); }
+                        else { fullDocMsg.streaming = false; }
                     };
 
                     await ApiClient.queryStream(
@@ -609,14 +664,21 @@ app.component('chat-panel', {
                         },
                         (data) => {
                             if (fdRafId !== null) { cancelAnimationFrame(fdRafId); fdRafId = null; }
-                            if (fdBuf) { fullDocMsg.content += fdBuf; fdBuf = ''; }
-                            fullDocMsg.content = data.answer || fullDocMsg.content;
-                            fullDocMsg.sources = data.sources || [];
-                            fullDocMsg.timing = data.timing || null;
-                            fullDocMsg.trace_id = data.trace_id || '';
-                            fullDocMsg.trace = data.trace || null;
-                            fullDocMsg.streaming = false;
-                            this.saveSession();
+                            const fullAnswer = data.answer || '';
+                            const released = fullDocMsg.content;
+                            const pending = fdBuf;
+                            const streamedTotal = released + pending;
+                            if (fullAnswer === streamedTotal) {
+                                // 完整，继续释放 pending
+                            } else if (fullAnswer.startsWith(streamedTotal)) {
+                                fdBuf = pending + fullAnswer.slice(streamedTotal.length);
+                            } else if (fullAnswer && !streamedTotal) {
+                                fdBuf = fullAnswer;
+                            } else {
+                                fullDocMsg.content = '';
+                                fdBuf = fullAnswer;
+                            }
+                            finishFd(data);
                         },
                         (err) => {
                             if (fdRafId !== null) { cancelAnimationFrame(fdRafId); fdRafId = null; }

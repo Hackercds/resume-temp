@@ -573,17 +573,50 @@ class RAGService:
         """
         if not candidates:
             return []
-        if max_per_doc <= 0 or len(candidates) <= top_k:
-            # 候选不多于 top_k，无需多样性裁剪，直接按分数取
-            return self._sort_candidates_by_score(candidates)[:top_k]
-
-        # 1. 按分数降序（rerank_score 优先，回退 score），但 entity_match 优先
+        # 按分数降序（rerank_score 优先，回退 score），entity_match/entity_chunk 优先
         ranked = self._sort_candidates_by_score(candidates)
-        # entity_match 的候选排到最前（实体命中文档优先覆盖）
-        ranked.sort(key=lambda c: not c.get("entity_match", False))
+        # entity_match 文档排前；同文档内 entity_chunk（含实体词）排前
+        ranked.sort(key=lambda c: (
+            not c.get("entity_match", False),
+            not c.get("entity_chunk", False),
+        ))
 
-        # 2. 第一轮：文档覆盖优先 —— 每个不同文档先各取1个最高分代表
-        #    entity_match 文档因排序靠前，优先占据席位
+        if max_per_doc <= 0:
+            return ranked[:top_k]
+
+        # 候选数 ≤ top_k：仍按 per-doc cap 取，不足时回退补齐（保证信息量）
+        # 同文档内 entity_chunk 优先（已由排序保证）
+        if len(ranked) <= top_k:
+            selected = []
+            doc_count: Dict[str, int] = {}
+            # 第一轮：per-doc cap 内取
+            for c in ranked:
+                if len(selected) >= top_k:
+                    break
+                fn = c.get("file_name", "")
+                if doc_count.get(fn, 0) >= max_per_doc:
+                    continue
+                selected.append(c)
+                doc_count[fn] = doc_count.get(fn, 0) + 1
+            # 不足 top_k 回退：忽略 cap 补齐
+            if len(selected) < top_k and len(selected) < len(ranked):
+                sel_ids = {id(c) for c in selected}
+                for c in ranked:
+                    if len(selected) >= top_k:
+                        break
+                    if id(c) in sel_ids:
+                        continue
+                    selected.append(c)
+            return selected
+
+        # 2. 第一轮：文档覆盖优先 —— 每个不同文档先各取1个代表
+        #    对 entity_match 文档：优先选 entity_chunk（含实体词的 chunk，如作者页 #0
+        #    而非案例页 #20），确保选中的 chunk 含实体信息供 LLM 提取
+        selected: List[Dict] = []
+        doc_count: Dict[str, int] = {}
+        # 2. 第一轮：文档覆盖优先 —— 每个不同文档先各取1个代表
+        #    ranked 已按 entity_match → entity_chunk → 分数 排序，故同文档内
+        #    entity_chunk（含实体词，如作者页 #0）先于非 entity_chunk（案例页 #20）被选
         selected: List[Dict] = []
         doc_count: Dict[str, int] = {}
         doc_seen: set = set()
@@ -1306,8 +1339,14 @@ class RAGService:
     def _mark_entity_matched_chunks(self, candidates: List[Dict],
                                      entities: List[str]) -> int:
         """
-        扫描候选池，对「实体命中文档」标记 entity_match=True。
-        复用 _identify_entity_documents 的判定（name_match ∪ BM25 top-3）。
+        扫描候选池：
+        - 对「实体命中文档」的 chunk 标记 entity_match=True（文档级优先覆盖）
+        - 对「BM25 命中实体的 chunk」标记 entity_chunk=True（chunk 级含实体词）
+        面试点：为什么区分 entity_match 与 entity_chunk？
+        答：entity_match 标记文档（涉警论文是张成都的论文），entity_chunk 标记
+            该文档中真正含「张成都」的 chunk（如作者页 #0，而非案例页 #20）。
+            多样性选择第一轮选文档代表时，对 entity_match 文档优先选 entity_chunk，
+            确保选中的 chunk 含实体信息，LLM 能提取身份/作者等关键事实。
         返回标记的 chunk 数。
         """
         if not entities or not candidates:
@@ -1315,11 +1354,21 @@ class RAGService:
         entity_docs = self._identify_entity_documents(entities)
         if not entity_docs:
             return 0
+        # 收集 BM25 命中的 chunk_id（这些 chunk 内容一定含实体词）
+        entity_chunk_ids: set = set()
+        for entity in entities[:3]:
+            try:
+                results = self.es.search_keyword_only(entity, 15)
+                entity_chunk_ids.update(r.get("chunk_id") for r in results if r.get("chunk_id"))
+            except Exception:
+                continue
         marked = 0
         for c in candidates:
             if c.get("file_name") in entity_docs:
                 c["entity_match"] = True
                 marked += 1
+            if c.get("chunk_id") in entity_chunk_ids:
+                c["entity_chunk"] = True
         return marked
 
 
