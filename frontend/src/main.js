@@ -437,6 +437,10 @@ app.component('chat-panel', {
                 timestamp: Date.now()
             };
             this.messages.push(assistantMsg);
+            // 关键修复：Vue3 push 后数组里存的是 reactive proxy，但 assistantMsg 仍指向原始对象。
+            // 直接改原始对象不触发响应式更新（表现为流式 token 累积但不显示，直到 done
+            // 触发组件重渲染才一次性全出，含来源信息一起出现）。取回 reactive 引用再修改。
+            const assistantMsgRef = this.messages[this.messages.length - 1];
 
             try {
                 const body = {
@@ -468,25 +472,23 @@ app.component('chat-panel', {
                 await ApiClient.queryStream(
                     body,
                     (token) => {
-                        assistantMsg.content += token;
+                        assistantMsgRef.content += token;
                         this.statusText = '生成中';
                         throttledScroll();
                     },
                     (data) => {
                         // 校准 content：仅当 answer 比已流式内容更长时才覆盖
-                        // （避免 done 的 answer 与流式 token 一致时覆盖导致内容跳动；
-                        //  全文重生成时 answer 更完整才覆盖）
                         const ans = data.answer || '';
-                        if (ans && ans.length > (assistantMsg.content || '').length) {
-                            assistantMsg.content = ans;
-                        } else if (!assistantMsg.content) {
-                            assistantMsg.content = ans;
+                        if (ans && ans.length > (assistantMsgRef.content || '').length) {
+                            assistantMsgRef.content = ans;
+                        } else if (!assistantMsgRef.content) {
+                            assistantMsgRef.content = ans;
                         }
-                        assistantMsg.sources = data.sources || [];
-                        assistantMsg.timing = data.timing || null;
-                        assistantMsg.trace_id = data.trace_id || '';
-                        assistantMsg.trace = data.trace || null;
-                        assistantMsg.streaming = false;  // 立即切 Markdown 渲染
+                        assistantMsgRef.sources = data.sources || [];
+                        assistantMsgRef.timing = data.timing || null;
+                        assistantMsgRef.trace_id = data.trace_id || '';
+                        assistantMsgRef.trace = data.trace || null;
+                        assistantMsgRef.streaming = false;  // 立即切 Markdown 渲染
                         this.followUpQuestions = this._generateFollowUpQuestions(data.sources || []);
                         this.saveSession();
                     },
@@ -495,8 +497,8 @@ app.component('chat-panel', {
                         this.errorSuggestion = err.suggestion || '';
                         this.emptyRetrieval = !!err.emptyRetrieval;
                         this.errorRetryable = !this.emptyRetrieval;
-                        assistantMsg.streaming = false;
-                        const idx = this.messages.findIndex(m => m.id === assistantMsg.id);
+                        assistantMsgRef.streaming = false;
+                        const idx = this.messages.findIndex(m => m.id === assistantMsgRef.id);
                         if (idx >= 0) this.messages.splice(idx, 1);
                         this.$emit('notify', err.message, 'error');
                     }
@@ -506,8 +508,8 @@ app.component('chat-panel', {
                 this.errorSuggestion = e.suggestion || '';
                 this.emptyRetrieval = !!e.emptyRetrieval;
                 this.errorRetryable = !this.emptyRetrieval;
-                assistantMsg.streaming = false;
-                const idx = this.messages.findIndex(m => m.id === assistantMsg.id);
+                assistantMsgRef.streaming = false;
+                const idx = this.messages.findIndex(m => m.id === assistantMsgRef.id);
                 if (idx >= 0) this.messages.splice(idx, 1);
                 this.$emit('notify', e.message, 'error');
             } finally {
@@ -578,6 +580,8 @@ app.component('chat-panel', {
                     timestamp: Date.now()
                 };
                 this.messages.splice(insertIdx, 0, fullDocMsg);
+                // 同 doQuery：取回 reactive 引用，否则修改原始对象不触发响应式更新
+                const fullDocMsgRef = this.messages[insertIdx];
 
                 const body = {
                     question: queryText,
@@ -594,26 +598,26 @@ app.component('chat-panel', {
                 return ApiClient.queryStream(
                     body,
                     (token) => {
-                        fullDocMsg.content += token;
+                        fullDocMsgRef.content += token;
                         throttledScroll();
                     },
                     (data) => {
                         const ans = data.answer || '';
-                        if (ans && ans.length > (fullDocMsg.content || '').length) {
-                            fullDocMsg.content = ans;
-                        } else if (!fullDocMsg.content) {
-                            fullDocMsg.content = ans;
+                        if (ans && ans.length > (fullDocMsgRef.content || '').length) {
+                            fullDocMsgRef.content = ans;
+                        } else if (!fullDocMsgRef.content) {
+                            fullDocMsgRef.content = ans;
                         }
-                        fullDocMsg.sources = data.sources || [];
-                        fullDocMsg.timing = data.timing || null;
-                        fullDocMsg.trace_id = data.trace_id || '';
-                        fullDocMsg.trace = data.trace || null;
-                        fullDocMsg.streaming = false;
+                        fullDocMsgRef.sources = data.sources || [];
+                        fullDocMsgRef.timing = data.timing || null;
+                        fullDocMsgRef.trace_id = data.trace_id || '';
+                        fullDocMsgRef.trace = data.trace || null;
+                        fullDocMsgRef.streaming = false;
                         this.saveSession();
                     },
                     (err) => {
-                        fullDocMsg.content = `⚠ ${err.message}`;
-                        fullDocMsg.streaming = false;
+                        fullDocMsgRef.content = `⚠ ${err.message}`;
+                        fullDocMsgRef.streaming = false;
                         this.$emit('notify', err.message, 'error');
                     }
                 );
