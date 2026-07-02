@@ -238,6 +238,19 @@ class TestRetrieveFullDocMarks:
         text = "普通答案，没有标记"
         assert rag._strip_retrieve_marks(text) == text
 
+    def test_build_prompt_no_undefined_var(self):
+        """回归：_build_prompt 不引用未定义变量（如 full_doc_hint）"""
+        from internal.service.llm_service import LLMService
+        llm = LLMService()
+        # 两种参数都应正常生成，不抛 NameError
+        p1 = llm._build_prompt("问题", "上下文", allow_full_doc_retrieval=True)
+        p2 = llm._build_prompt("问题", "上下文", allow_full_doc_retrieval=False)
+        assert "已知信息" in p1
+        assert "已知信息" in p2
+        # 不应含已移除的自动召回标记指令
+        assert "{{retrieve_full_doc" not in p1
+        assert "{full_doc_hint}" not in p1
+
     def test_need_full_documents_single(self):
         """单标记 → 单文件"""
         from internal.service.rag_service import RAGService
