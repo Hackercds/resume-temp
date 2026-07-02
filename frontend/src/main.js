@@ -169,6 +169,18 @@ app.component('api-key-config', {
                 <option v-for="m in modelDatalist" :value="m" />
             </datalist>
         </div>
+        <!-- 自定义 Base URL：custom provider 或选了带 base_url 的预设时露出。
+             没填时后端走 OpenAI/Anthropic 官方；填了就走用户指定（OpenAI 兼容协议）。 -->
+        <div v-if="showBaseUrl" class="baseurl-row">
+            <label>
+                Base URL（自定义 API 地址）
+                <span class="baseurl-hint">{{ apiConfig.baseUrl ? '已启用' : '未填则走默认' }}</span>
+            </label>
+            <input :value="apiConfig.baseUrl"
+                @input="update('baseUrl', $event.target.value)"
+                placeholder="https://api.deepseek.com/v1"
+                spellcheck="false" autocomplete="off" />
+        </div>
         <button class="eye-btn" @click="showKey = !showKey" :title="showKey ? '隐藏' : '显示'">
             {{ showKey ? '🙈' : '👁' }}
         </button>
@@ -180,6 +192,17 @@ app.component('api-key-config', {
     </div>
     `,
     data() { return { showKey: false }; },
+    computed: {
+        // Base URL 露出条件：custom provider，或当前选了带 base_url 的预设
+        showBaseUrl() {
+            if (this.apiConfig.provider === 'custom') return true;
+            const cur = (this.llmPresets || []).find(p =>
+                p.name && p.name !== '自定义' && p.provider === this.apiConfig.provider
+                && (!this.apiConfig.model || p.model === this.apiConfig.model)
+            );
+            return !!(cur && cur.base_url);
+        }
+    },
     methods: {
         update(key, val) { this.apiConfig[key] = val; },
         applyPreset(name) {
@@ -187,6 +210,7 @@ app.component('api-key-config', {
             if (!p) return;
             this.apiConfig.provider = p.provider || 'openai';
             this.apiConfig.model = p.model || '';
+            // 预设带 base_url 就回填（用户可继续手改），不带就清空
             this.apiConfig.baseUrl = p.base_url || '';
         }
     }
@@ -337,6 +361,48 @@ app.component('chat-panel', {
 
         <!-- 输入区 -->
         <div class="input-area">
+            <!-- 历史记忆管理（A+B：全局 toggle + 逐条勾选排除） -->
+            <div class="history-bar">
+                <button class="history-toggle-chip"
+                    :class="{ disabled: !useHistory }"
+                    @click="useHistory = !useHistory"
+                    :title="useHistory ? '点击关闭历史上下文（下次发送将不带 history）' : '点击开启历史上下文'">
+                    <span class="dot"></span>
+                    📌 使用历史上下文
+                    <span v-if="useHistory" class="history-count">{{ historyPreview.length }} 条</span>
+                    <span v-else>（已关闭）</span>
+                </button>
+                <button v-if="useHistory && historyPreview.length" class="history-toggle-chip"
+                    @click="historyPanelOpen = !historyPanelOpen"
+                    title="逐条勾选/排除历史">
+                    {{ historyPanelOpen ? '收起' : '管理' }}
+                </button>
+            </div>
+            <div v-if="useHistory && historyPanelOpen" class="history-panel">
+                <div class="history-panel-header">
+                    <span>本次将发送给模型的对话历史（取消勾选=本轮不发）</span>
+                    <span class="ops">
+                        <button @click="historyExcludeAll">反选</button>
+                        <button @click="historyIncludeAll">全选</button>
+                    </span>
+                </div>
+                <div v-if="!historyPreview.length" class="history-panel-empty">
+                    当前会话暂无历史消息
+                </div>
+                <div v-for="(m, hi) in historyPreview" :key="m.id || hi"
+                    class="history-item" :class="{ excluded: m.excluded }">
+                    <input type="checkbox"
+                        :checked="!m.excluded"
+                        @change="toggleHistoryItem(hi, $event.target.checked)" />
+                    <div class="history-item-body">
+                        <div class="history-item-role">{{ m.role === 'user' ? '用户' : '助手' }}</div>
+                        <div class="history-item-content" :class="{ assistant: m.role === 'assistant' }">
+                            {{ m.preview }}
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <textarea v-model="question" placeholder="输入问题，Ctrl + Enter 发送"
                 @keydown.ctrl.enter="doQuery" @keydown.meta.enter="doQuery"
                 :disabled="loading" rows="2"></textarea>
@@ -365,6 +431,10 @@ app.component('chat-panel', {
             expandedIdx: -1,
             expandedMsgIdx: -1,
             maxHistory: 5,
+            // 历史记忆（A+B 设计）
+            useHistory: true,                 // 全局开关：是否带上历史
+            historyPanelOpen: false,          // 是否展开逐条管理面板
+            historyExclude: {},               // { msgId: true } 本轮排除的消息 id
             lastQuestion: '',
             followUpQuestions: [],
             documents: [],
@@ -380,6 +450,25 @@ app.component('chat-panel', {
                 (s.title || '').toLowerCase().includes(q) ||
                 (s.messages || []).some(m => (m.content || '').toLowerCase().includes(q))
             );
+        },
+        /**
+         * 历史预览：面板里展示给用户看的列表
+         * 面试点：面板直接复用 messages，不存第二份真相；
+         * excluded 状态由 historyExclude 这个 id→bool 映射单独存，刷新会话自动重置。
+         */
+        historyPreview() {
+            const list = [];
+            for (let i = 0; i < this.messages.length; i++) {
+                const m = this.messages[i];
+                if (m.role !== 'user' && m.role !== 'assistant') continue;
+                list.push({
+                    id: m.id || i,
+                    role: m.role,
+                    preview: (m.content || '').slice(0, 80),
+                    excluded: !!this.historyExclude[m.id || i]
+                });
+            }
+            return list;
         }
     },
     mounted() {
@@ -423,14 +512,19 @@ app.component('chat-panel', {
             this.followUpQuestions = [];
             this.forceScrollToBottom();  // 用户发送，强制滚到底
 
-            const history = this.messages
+            // 全局 toggle 关 → 直接传空 history；开 → 按 historyExclude 过滤逐条
+            const rawHistory = this.messages
                 .filter(m => m.role === 'user' || m.role === 'assistant')
-                .slice(-(this.maxHistory * 2))
-                .map(m => ({
-                    role: m.role,
-                    content: m.content,
-                    sources: (m.sources || []).map(s => ({ file_name: s.file_name, score: s.score }))
-                }));
+                .slice(-(this.maxHistory * 2));
+            const history = this.useHistory
+                ? rawHistory
+                    .filter(m => !this.historyExclude[m.id])
+                    .map(m => ({
+                        role: m.role,
+                        content: m.content,
+                        sources: (m.sources || []).map(s => ({ file_name: s.file_name, score: s.score }))
+                    }))
+                : [];
 
             const assistantMsg = {
                 id: Date.now() + 1,
@@ -723,6 +817,36 @@ app.component('chat-panel', {
             this.followUpQuestions = [];
             this.expandedIdx = -1;
             this.expandedMsgIdx = -1;
+            this.historyExclude = {};  // 新会话清空历史排除
+        },
+        /**
+         * 历史逐条勾选/排除（本轮请求级别，不影响消息本身）
+         * 面试点：这种"本轮作用域"的 UI 状态用 id 映射，不要污染 messages 对象。
+         * 换会话时 historyExclude 自动失去意义（id 对不上新 messages），所以新会话清空。
+         */
+        toggleHistoryItem(idx, checked) {
+            const m = this.historyPreview[idx];
+            if (!m) return;
+            // 反映回原始消息：读 messages 找到对应 id（顺序与 historyPreview 一致）
+            let cur = 0;
+            for (const mm of this.messages) {
+                if (mm.role !== 'user' && mm.role !== 'assistant') continue;
+                if (cur === idx) {
+                    if (checked) delete this.historyExclude[mm.id];
+                    else this.historyExclude[mm.id] = true;
+                    return;
+                }
+                cur++;
+            }
+        },
+        historyExcludeAll() {
+            // 反选：所有 excluded=false 的变成 true
+            for (const m of this.historyPreview) {
+                if (!m.excluded) this.historyExclude[m.id] = true;
+            }
+        },
+        historyIncludeAll() {
+            this.historyExclude = {};
         },
         deleteSession(id) {
             if (!confirm('删除该对话？')) return;
@@ -747,6 +871,7 @@ app.component('chat-panel', {
                 this.error = '';
                 this.expandedIdx = -1;
                 this.expandedMsgIdx = -1;
+                this.historyExclude = {};  // 切会话清空旧 exclude（id 已对不上）
             }
         },
         saveSession(isNew = false) {

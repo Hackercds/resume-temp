@@ -1004,3 +1004,104 @@ h1, h2, h3, h4 { font-weight: 600; color: var(--text); line-height: 1.35; }
     .input-area-actions { flex-direction: column; gap: 8px; align-items: stretch; }
     .btn-send { width: 100%; padding: 10px; }
 }
+
+/* ============================================================
+   Base URL 自定义（Provider=custom 或自定义模型时显示）
+   ============================================================ */
+.baseurl-row {
+    grid-column: 1 / -1;  /* 占整行，URL 一般较长 */
+}
+.baseurl-row label {
+    display: flex; justify-content: space-between; align-items: center;
+}
+.baseurl-row .baseurl-hint { font-size: 12px; color: var(--text-3); font-weight: normal; }
+.baseurl-row input {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+}
+
+/* ============================================================
+   历史记忆管理面板（A+B 设计）
+   ============================================================ */
+.history-bar {
+    margin: 8px 0 6px;
+    display: flex; align-items: center; gap: 10px;
+    flex-wrap: wrap;
+}
+.history-toggle-chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 5px 12px;
+    border: 1px solid var(--mint-200);
+    background: var(--mint-50);
+    color: var(--mint-700);
+    border-radius: 999px;
+    font-size: 13px;
+    cursor: pointer;
+    user-select: none;
+    transition: all .15s ease;
+}
+.history-toggle-chip:hover { background: var(--mint-100); }
+.history-toggle-chip.disabled {
+    background: transparent;
+    color: var(--text-3);
+    border-color: var(--border-1);
+}
+.history-toggle-chip .dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--mint-500);
+}
+.history-toggle-chip.disabled .dot { background: var(--text-3); }
+.history-count { font-weight: 600; }
+
+.history-panel {
+    margin: 4px 0 8px;
+    padding: 10px 12px;
+    background: var(--bg-1);
+    border: 1px solid var(--border-1);
+    border-radius: 8px;
+    font-size: 13px;
+    animation: slideIn .15s ease;
+}
+.history-panel-header {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 8px;
+    color: var(--text-2);
+}
+.history-panel-header .ops { display: flex; gap: 8px; }
+.history-panel-header button {
+    background: none; border: none; cursor: pointer;
+    color: var(--mint-600); font-size: 12px; padding: 2px 4px;
+}
+.history-panel-header button:hover { text-decoration: underline; }
+.history-panel-empty { color: var(--text-3); padding: 8px 0; text-align: center; }
+
+.history-item {
+    display: flex; align-items: flex-start; gap: 8px;
+    padding: 6px 4px;
+    border-bottom: 1px dashed var(--border-1);
+}
+.history-item:last-child { border-bottom: none; }
+.history-item.excluded { opacity: 0.45; }
+.history-item input[type=checkbox] {
+    margin-top: 3px;
+    accent-color: var(--mint-600);
+    cursor: pointer;
+}
+.history-item-body { flex: 1; min-width: 0; }
+.history-item-role {
+    font-size: 11px;
+    color: var(--text-3);
+    margin-bottom: 2px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+.history-item-content {
+    color: var(--text-1);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    word-break: break-word;
+}
+.history-item-content.assistant { color: var(--text-2); font-style: italic; }
