@@ -282,6 +282,13 @@ app.component('chat-panel', {
                                     🔍 召回所选文档生成深度回答{{ msg.selectedDocs && msg.selectedDocs.length ? '（' + msg.selectedDocs.length + ' 个）' : '（未选择）' }}
                                 </button>
                             </div>
+                            <div v-if="msg.ungrounded" class="grounded-warn" title="答案中包含具体数字/日期但未引用任何来源（heuristic），可能为 LLM 编造">
+                                ⚠ 本回答包含具体数字/日期但未引用任何来源，请核实。
+                            </div>
+                            <div v-if="msg.trace && msg.trace.history_quoted_files && msg.trace.history_quoted_files.length"
+                                class="history-quoted" title="本次检索参考了你之前对话里引用过的文档，帮助保持多轮连贯性">
+                                📎 本次召回参考了历史引用：{{ msg.trace.history_quoted_files.join('、') }}
+                            </div>
                             <button v-if="msg.trace" class="trace-toggle" @click="msg.showTrace = !msg.showTrace">
                                 {{ msg.showTrace ? '— 收起检索过程' : '+ 查看检索过程' }}
                             </button>
@@ -592,6 +599,7 @@ app.component('chat-panel', {
                         assistantMsgRef.timing = data.timing || null;
                         assistantMsgRef.trace_id = data.trace_id || '';
                         assistantMsgRef.trace = data.trace || null;
+                        assistantMsgRef.ungrounded = !!data.ungrounded;
                         assistantMsgRef.streaming = false;  // 立即切 Markdown 渲染
                         this.followUpQuestions = this._generateFollowUpQuestions(data.sources || []);
                         this.saveSession();
@@ -688,6 +696,7 @@ app.component('chat-panel', {
                         else if (!ref.content) ref.content = ans;
                         ref.sources = data.sources || [];
                         ref.timing = data.timing || null;
+                        ref.ungrounded = !!data.ungrounded;
                         ref.streaming = false;
                         this.saveSession();
                     },

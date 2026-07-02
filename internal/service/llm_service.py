@@ -77,6 +77,27 @@ class LLMService:
              "content": "你是一个专业的知识库问答助手。请严格基于知识库内容回答，不要编造信息。"}
         ]
         if history:
+            quoted_files = []
+            for m in history:
+                if m.get("role") != "assistant":
+                    continue
+                for s in (m.get("sources") or []):
+                    fn = s.get("file_name")
+                    if fn and fn not in quoted_files:
+                        quoted_files.append(fn)
+            if quoted_files:
+                ref_list = "\n".join(f"- {f}" for f in quoted_files)
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "【历次对话引用源（仅作背景；本次回答以最新检索结果为准）】\n"
+                        f"{ref_list}\n\n"
+                        "注意：用户可能追问上一轮你提到的细节（如日期、数字、术语）。"
+                        "本次回答请基于最新检索结果，并可参考以上引用源文件名辅助定位。"
+                        "如果你发现上一轮你说过某个具体日期/数字在本次检索结果里"
+                        "找不到依据，请明确告知用户并修正，不要硬撑。"
+                    )
+                })
             for m in history:
                 if m.get("role") in ("user", "assistant") and m.get("content"):
                     messages.append({"role": m["role"], "content": m["content"]})
@@ -134,6 +155,27 @@ class LLMService:
 
         messages = []
         if history:
+            quoted_files = []
+            for m in history:
+                if m.get("role") != "assistant":
+                    continue
+                for s in (m.get("sources") or []):
+                    fn = s.get("file_name")
+                    if fn and fn not in quoted_files:
+                        quoted_files.append(fn)
+            if quoted_files:
+                ref_list = "\n".join(f"- {f}" for f in quoted_files)
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "【历次对话引用源（仅作背景；本次回答以最新检索结果为准）】\n"
+                        f"{ref_list}\n\n"
+                        "注意：用户可能追问上一轮你提到的细节（如日期、数字、术语）。"
+                        "本次回答请基于最新检索结果，并可参考以上引用源文件名辅助定位。"
+                        "如果你发现上一轮你说过某个具体日期/数字在本次检索结果里"
+                        "找不到依据，请明确告知用户并修正，不要硬撑。"
+                    )
+                })
             for m in history:
                 if m.get("role") in ("user", "assistant") and m.get("content"):
                     messages.append({"role": m["role"], "content": m["content"]})
@@ -224,6 +266,27 @@ class LLMService:
              "content": "你是一个专业的知识库问答助手。请严格基于知识库内容回答，不要编造信息。"}
         ]
         if history:
+            quoted_files = []
+            for m in history:
+                if m.get("role") != "assistant":
+                    continue
+                for s in (m.get("sources") or []):
+                    fn = s.get("file_name")
+                    if fn and fn not in quoted_files:
+                        quoted_files.append(fn)
+            if quoted_files:
+                ref_list = "\n".join(f"- {f}" for f in quoted_files)
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "【历次对话引用源（仅作背景；本次回答以最新检索结果为准）】\n"
+                        f"{ref_list}\n\n"
+                        "注意：用户可能追问上一轮你提到的细节（如日期、数字、术语）。"
+                        "本次回答请基于最新检索结果，并可参考以上引用源文件名辅助定位。"
+                        "如果你发现上一轮你说过某个具体日期/数字在本次检索结果里"
+                        "找不到依据，请明确告知用户并修正，不要硬撑。"
+                    )
+                })
             for m in history:
                 if m.get("role") in ("user", "assistant") and m.get("content"):
                     messages.append({"role": m["role"], "content": m["content"]})
@@ -304,6 +367,27 @@ class LLMService:
 
         messages = []
         if history:
+            quoted_files = []
+            for m in history:
+                if m.get("role") != "assistant":
+                    continue
+                for s in (m.get("sources") or []):
+                    fn = s.get("file_name")
+                    if fn and fn not in quoted_files:
+                        quoted_files.append(fn)
+            if quoted_files:
+                ref_list = "\n".join(f"- {f}" for f in quoted_files)
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "【历次对话引用源（仅作背景；本次回答以最新检索结果为准）】\n"
+                        f"{ref_list}\n\n"
+                        "注意：用户可能追问上一轮你提到的细节（如日期、数字、术语）。"
+                        "本次回答请基于最新检索结果，并可参考以上引用源文件名辅助定位。"
+                        "如果你发现上一轮你说过某个具体日期/数字在本次检索结果里"
+                        "找不到依据，请明确告知用户并修正，不要硬撑。"
+                    )
+                })
             for m in history:
                 if m.get("role") in ("user", "assistant") and m.get("content"):
                     messages.append({"role": m["role"], "content": m["content"]})
@@ -380,9 +464,11 @@ class LLMService:
 
 用户问题：{question}
 
-回答要求：
-1. 优先基于上面的"已知信息"回答，并在引用事实时标注来源编号（如「据【来源1】」）。
+回答要求（严格遵守，逐条执行）：
+1. 优先基于上面的"已知信息"回答。引用事实时**必须**标注来源编号（如「据【来源1】」），不要给出无法映射到已知信息具体来源的陈述。
 2. 如果"已知信息"中同时出现同一来源的相邻片段，应合并理解，不要把它们当成矛盾信息重复列举。
-3. 如果"已知信息"完全不相关或不足以回答，请如实说明"知识库中未找到相关内容"，并提示用户换个问法或上传相关文档，不要用外部知识补全。
-4. 回答要简洁准确、条理清晰；涉及列举时用要点或表格，避免冗长铺陈。
-5. 回答使用中文。"""
+3. 引用编号与内容必须一一对应——不要捏造"【来源N】"编号去支撑你编造的事实，也不要把【来源1】的内容标成【来源2】。
+4. **如果"已知信息"完全不相关或不足以回答，请如实回答"知识库中未找到相关内容"**，并提示用户换个问法或上传相关文档，不要用外部知识补全；这是最重要的防幻觉约束。
+5. 涉及具体数字、日期、名称时尤其谨慎：必须能在已知信息中找到对应原文才能写，不能凭"看起来合理"就推断。
+6. 回答要简洁准确、条理清晰；涉及列举时用要点或表格，避免冗长铺陈。
+7. 回答使用中文。"""

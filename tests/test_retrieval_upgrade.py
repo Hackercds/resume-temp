@@ -1532,3 +1532,77 @@ class TestHistoricalSourceBoostActive:
         out = svc._boost_historical_sources(candidates, [], boost=0.15)
         assert out[0]["score"] == 0.5  # 没分加
         assert "source_boost" not in out[0]
+
+
+class TestUngroundedDetection:
+    """防幻觉兜底：答案含具体数字/日期但无任何来源引用 → ungrounded=True
+    用户实测：AI 把「每月底27号」曲解成「15-17日」并编来源编号。这种答案前端应警示。"""
+
+    def test_ungrounded_when_date_no_cite(self):
+        from internal.service.rag_service import RAGService
+        assert RAGService._detect_ungrounded(
+            "每月 15-17 日会收到邮件。"
+        ) is True
+
+    def test_grounded_when_date_with_cite(self):
+        from internal.service.rag_service import RAGService
+        # 有日期且有【来源N】引用 → 视为有依据
+        ans = "每月 15 日发放【来源1】，试用期不享受年假【来源2】。"
+        assert RAGService._detect_ungrounded(ans) is False
+
+    def test_grounded_when_no_specific_number(self):
+        from internal.service.rag_service import RAGService
+        # 没数字/日期时不要误报
+        assert RAGService._detect_ungrounded(
+            "新员工应认真阅读指引并签字确认。"
+        ) is False
+
+    def test_ungrounded_year_and_pct(self):
+        from internal.service.rag_service import RAGService
+        assert RAGService._detect_ungrounded(
+            "2025 年起该比例提升至 90%。"
+        ) is True
+
+    def test_grounded_with_partial_year_and_cite(self):
+        from internal.service.rag_service import RAGService
+        ans = "根据 2024-03-15 的更新文档【来源3】，调整如下。"
+        assert RAGService._detect_ungrounded(ans) is False
+
+
+class TestRewriteHistoryQuotedFiles:
+    """多轮盲点：_rewrite_query 必须从 history assistant 的 sources 收集历史引用文件，
+    让后续 BM25/向量检索能回到历史引用的源（用户问「我上轮说的 X 依据是哪个文档」）。"""
+
+    def test_collects_files_from_assistant_sources(self):
+        from internal.service.rag_service import RAGService
+        svc = RAGService.__new__(RAGService)
+        history = [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1",
+             "sources": [{"file_name": "a.pdf"}, {"file_name": "b.pdf"}]},
+            {"role": "user", "content": "q2"},
+            {"role": "assistant", "content": "a2",
+             "sources": [{"file_name": "a.pdf"}, {"file_name": "c.md"}]},
+        ]
+        out = svc._rewrite_query("刚才说的 X 在哪里", "follow_up", history)
+        assert set(out["history_quoted_files"]) == {"a.pdf", "b.pdf", "c.md"}
+
+    def test_history_quoted_files_collected_even_when_new_topic(self):
+        """多轮盲点修复：即便 intent=new_topic 也要从历史 sources 收集引用文件——
+        偶尔用户把追问说成看似独立主题句（"刚才那个 X 在哪说过"），
+        锚点帮助 BM25/向量回到历史文档。"""
+        from internal.service.rag_service import RAGService
+        svc = RAGService.__new__(RAGService)
+        history = [
+            {"role": "assistant", "content": "a",
+             "sources": [{"file_name": "a.pdf"}]},
+        ]
+        out = svc._rewrite_query("新问题", "new_topic", history)
+        assert out["history_quoted_files"] == ["a.pdf"]
+
+    def test_empty_when_no_sources_in_history(self):
+        from internal.service.rag_service import RAGService
+        svc = RAGService.__new__(RAGService)
+        history = [{"role": "assistant", "content": "a"}]
+        out = svc._rewrite_query("追问", "follow_up", history)
+        assert out["history_quoted_files"] == []

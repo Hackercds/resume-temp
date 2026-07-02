@@ -100,7 +100,14 @@ class TimingInfo(BaseModel):
 
 
 class QueryTrace(BaseModel):
-    """检索过程追踪，用于调试与前端展示"""
+    """检索过程追踪，用于调试与前端展示
+
+    历史/可观测字段透传：调试用的任意新字段（history_quoted_files、
+    retrieval_method 等）由后端添加，前端能完整看到——这是「可观测性
+    不丢失」的工程实践。严格 schema 会丢字段，ChatMessage/QueryTrace
+    这类"日志/追踪"模型统一放行额外字段。
+    """
+    model_config = {"extra": "allow"}
     trace_id: str = ""
     intent: Optional[str] = None
     original_question: str = ""
@@ -113,6 +120,9 @@ class QueryTrace(BaseModel):
     # 文档多样性结果（v1.3）：primary 命中数、覆盖的文档列表
     primary_count: int = 0
     primary_docs: List[str] = Field(default_factory=list)
+    # 多轮盲点修复（v1.5）：历次 assistant 引用过的文件（让前端能展示
+    # "本次检索参考了你之前看过的 X 文档"，并辅助 BM25 回到历史引用源）
+    history_quoted_files: List[str] = Field(default_factory=list)
     full_doc_requested: bool = False
     error: Optional[str] = None
 

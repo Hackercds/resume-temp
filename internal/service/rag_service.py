@@ -54,8 +54,10 @@ class RAGService:
         返回 dict：{
             "original": question,
             "expanded": 指代消解后的独立问句,
-            "context": 带上下文的查询,
-            "intent": intent
+            "context": 带上下文的查询（喂给 BM25 + rerank）,
+            "intent": intent,
+            "history_quoted_files": 历次对话里出现过的文件（用于 source boost 之外，
+                                  还可让 context 检索回到历史引用的源）
         }
         """
         cfg = get_config().conversation
@@ -64,15 +66,22 @@ class RAGService:
             "expanded": question,
             "context": question,
             "intent": intent,
+            "history_quoted_files": [],
         }
 
-        if not cfg.enable_query_rewrite or intent == "new_topic" or not history:
+        if not cfg.enable_query_rewrite or not history:
+            # 即使 new_topic 或 disable_query_rewrite，也要从历史里收集引用文件；
+            # 这是多轮盲点修复的入口之一（与 rewrite 解耦）。
+            result["history_quoted_files"] = self._collect_quoted_files(history)
             return result
 
         # 提取最近 assistant 答案中的实体，做指代消解
         entities = IntentService.extract_entities(question, history)
         expanded = IntentService.resolve_references(question, entities)
         result["expanded"] = expanded
+
+        # 收集历次 assistant 引用的所有文件名（多轮盲点修复）
+        result["history_quoted_files"] = self._collect_quoted_files(history)
 
         # 取最近 2 条消息作为上下文
         recent = history[-2:] if len(history) >= 2 else history
@@ -94,6 +103,33 @@ class RAGService:
             result["context"] = f"{question}（上下文：{context_text[:300]}）"
 
         return result
+
+    def _build_historical_file_weights(self, history: List[Dict]) -> Dict[str, float]:
+        """
+        从历史 assistant 消息中构建 file_name → weight 映射。
+        权重 = 引用次数 + 时间衰减（越近越高）。
+        """
+        file_stats: Dict[str, Dict] = {}
+        if not history:
+            return file_stats
+
+    @staticmethod
+    def _collect_quoted_files(history: Optional[List[Dict]]) -> List[str]:
+        """从历史 assistant 消息的 sources 中收集所有引用过的文件名（保序去重）。
+        用于多轮盲点修复：让后续检索能回到历史引用的源文件。"""
+        if not history:
+            return []
+        quoted = []
+        for m in history:
+            if not isinstance(m, dict) or m.get("role") != "assistant":
+                continue
+            for s in m.get("sources") or []:
+                if not isinstance(s, dict):
+                    continue
+                fn = s.get("file_name")
+                if fn and fn not in quoted:
+                    quoted.append(fn)
+        return quoted
 
     def _build_historical_file_weights(self, history: List[Dict]) -> Dict[str, float]:
         """
@@ -228,12 +264,25 @@ class RAGService:
             trace["intent"] = intent
             trace["expanded_question"] = rewritten.get("expanded", question)
             trace["context_question"] = rewritten.get("context", question)
+            trace["history_quoted_files"] = rewritten.get("history_quoted_files", [])
             trace["rewrite_method"] = "intent+entity" if rewritten.get("expanded") != question else "none"
 
             # 同时用 expanded 和 context 做向量检索，然后融合
             rewritten_question = rewritten.get("context", question)
             expanded_question = rewritten.get("expanded", question)
             compressed_history = self._compress_history(history, threshold=cfg.summary_threshold)
+
+            # 多轮盲点修复：历次 assistant 引用的文件名也作为检索锚点
+            # —— 比如用户问"我上一轮说的 15-17 日是哪个文档写的"，光靠 context_question
+            #   不一定能命中（因为文件名 token 在历史 messages 里），拼接到 BM25 query 里可拉回原文档
+            history_quoted_files = rewritten.get("history_quoted_files", [])
+            trace["history_quoted_files"] = history_quoted_files
+            if history_quoted_files and intent in ("follow_up", "clarify", "summarize"):
+                file_anchor = " ".join(
+                    [s.replace(".pdf", "").replace(".md", "").replace("-", " ") for s in history_quoted_files]
+                )
+                rewritten_question = f"{rewritten_question}\n\n历次对话引用源关键词：{file_anchor}"
+                expanded_question = f"{expanded_question}\n\n历次对话引用源关键词：{file_anchor}"
 
             self.logger.info(trace_id, "rag_service",
                              "意图识别完成",
@@ -475,6 +524,10 @@ class RAGService:
                          total_ms=round(total_time_ms, 1),
                          sources=len(candidates))
 
+        # 兜底：答案里出现具体数字/日期却没有任何来源引用 → 标记 ungrounded
+        # 前端看到这个 flag 可以显示警示，提醒用户核对（防 LLM 幻觉自我吹嘘）
+        ungrounded = self._detect_ungrounded(answer)
+
         return {
             "answer": answer,
             "sources": [
@@ -491,7 +544,29 @@ class RAGService:
             "trace_id": trace_id,
             "timing": timing,
             "trace": trace,
+            "ungrounded": ungrounded,
         }
+
+    @staticmethod
+    def _detect_ungrounded(answer: str) -> bool:
+        """答案含具体数字/日期但没引用任何来源 → 视为 ungrounded。
+        启发式：
+          - 没有任何「【来源N】」/「据【来源N】」 → 无引用
+          - 含 4 位连续数字（含 / 或 - 分隔的日期或百分数） → 有具体数字
+        满足两条 → ungrounded=True（提示前端"答案未基于检索结果"）
+        面试点：LLM 在上下文不足时会"看起来合理地编"，这一层兜底让我们能在 UI 上预警。
+        """
+        if not answer:
+            return False
+        import re
+        has_cite = bool(re.search(r"【来源\s*\d+\s*】", answer))
+        # 中文日期、数字、百分比
+        has_specific = bool(re.search(
+            r"(\d{4}\s*年|\d{1,2}\s*月|\d{1,2}\s*日|\d{4}-\d{1,2}-\d{1,2}|"
+            r"\d+/\d+|\d{4}\.\d{1,2}|\d+%|\d+\.\d+%|\d{4,})",
+            answer
+        ))
+        return has_specific and not has_cite
 
     def _build_error_response(self, trace_id: str, timing: Dict, trace: Dict,
                               answer: str, suggestion: str = "",
@@ -689,11 +764,24 @@ class RAGService:
             trace["intent"] = intent
             trace["expanded_question"] = rewritten.get("expanded", question)
             trace["context_question"] = rewritten.get("context", question)
+            trace["history_quoted_files"] = rewritten.get("history_quoted_files", [])
             trace["rewrite_method"] = "intent+entity" if rewritten.get("expanded") != question else "none"
 
             rewritten_question = rewritten.get("context", question)
             expanded_question = rewritten.get("expanded", question)
             compressed_history = self._compress_history(history, threshold=cfg.summary_threshold)
+
+            # 多轮盲点修复（与 query() 同步）—— 始终收集历史引用文件并尝试召回，
+# 即使 intent=new_topic：用户偶尔会把追问说成新主题句（"刚才那个 X 在哪说过"），
+# 锚点提示帮助 BM25/向量回到历史文档；命中则命中，不命中也不影响其他召回。
+            history_quoted_files = rewritten.get("history_quoted_files", [])
+            trace["history_quoted_files"] = history_quoted_files
+            if history_quoted_files:
+                file_anchor = " ".join(
+                    [s.replace(".pdf", "").replace(".md", "").replace("-", " ") for s in history_quoted_files]
+                )
+                rewritten_question = f"{rewritten_question}\n\n历次对话引用源关键词：{file_anchor}"
+                expanded_question = f"{expanded_question}\n\n历次对话引用源关键词：{file_anchor}"
 
             self.logger.info(trace_id, "rag_service",
                              "流式查询意图识别完成",
@@ -976,6 +1064,7 @@ class RAGService:
                 "trace_id": trace_id,
                 "timing": timing,
                 "trace": trace,
+                "ungrounded": self._detect_ungrounded(answer),
             }
 
         except Exception as e:

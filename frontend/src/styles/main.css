@@ -1105,3 +1105,26 @@ h1, h2, h3, h4 { font-weight: 600; color: var(--text); line-height: 1.35; }
     word-break: break-word;
 }
 .history-item-content.assistant { color: var(--text-2); font-style: italic; }
+
+/* ============================================================
+   防幻觉警示 + 多轮引用提示
+   ============================================================ */
+.grounded-warn {
+    margin: 8px 0 0;
+    padding: 8px 12px;
+    background: #fff7e6;
+    border-left: 3px solid #faad14;
+    color: #ad6800;
+    font-size: 13px;
+    border-radius: 4px;
+}
+.history-quoted {
+    margin: 6px 0 0;
+    padding: 6px 12px;
+    background: var(--mint-50);
+    border-left: 3px solid var(--mint-500);
+    color: var(--mint-700);
+    font-size: 12px;
+    border-radius: 4px;
+    word-break: break-all;
+}
