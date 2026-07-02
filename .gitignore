@@ -43,3 +43,11 @@ docker-compose.override.yml
 # Sensitive
 *.pem
 *.key
+
+# Local scratch files (may contain API keys / payload samples from manual curl tests)
+tests/_tmp_*
+tests/_payload_*
+tests/_resp_*
+tests/_stream_*
+*._tmp.json
+*._tmp_*.txt
