@@ -560,6 +560,24 @@ h1, h2, h3, h4 { font-weight: 600; color: var(--text); line-height: 1.35; }
 }
 .btn-source-act:hover { background: var(--mint-50); border-color: var(--mint-400); color: var(--mint-700); }
 
+/* 来源卡片勾选框 + 多文档深度召回按钮 */
+.src-check { display: inline-flex; align-items: center; cursor: pointer; }
+.src-check input[type=checkbox] { width: 14px; height: 14px; accent-color: var(--mint-600); cursor: pointer; }
+.btn-multi-deep {
+    margin-top: 10px;
+    width: 100%;
+    font-size: 13px;
+    padding: 8px;
+    border: 1px dashed var(--mint-400);
+    background: var(--mint-50);
+    color: var(--mint-800);
+    border-radius: var(--r-1);
+    cursor: pointer;
+    transition: all 150ms ease;
+}
+.btn-multi-deep:hover:not(:disabled) { background: var(--mint-100); border-style: solid; }
+.btn-multi-deep:disabled { opacity: 0.5; cursor: not-allowed; }
+
 /* Trace toggle */
 .trace-toggle {
     margin-top: 10px;

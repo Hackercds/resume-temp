@@ -1366,3 +1366,97 @@ class TestSingleDocActions:
         assert tokens == "基于完整文档的详细答案"
         # 只召回指定文档，不是所有 primary
         mock_es_instance.retrieve_full_document.assert_called_once_with("a.pdf")
+
+
+class TestQueryRequestApiKeyValidation:
+    """面试点：API Key 按需校验——查看原文不需要 Key，深度回答才需要。
+    保证「查看全文」按钮对无 Key 用户也可用，按钮字面意思与行为一致。"""
+
+    def test_view_only_accepts_empty_api_key(self):
+        from internal.model.dto import QueryRequest
+        # view_only=True 且无 Key：合法（仅交付原文，不调 LLM）
+        req = QueryRequest(question="查看简历", api_key="", view_only=True,
+                          retrieve_full_doc=True, full_doc_files=["a.pdf"])
+        assert req.view_only is True
+        assert req.api_key == ""
+
+    def test_deep_answer_requires_api_key(self):
+        from internal.model.dto import QueryRequest
+        import pytest
+        # view_only=False 且无 Key：必须报错（深度回答要调 LLM）
+        with pytest.raises(Exception):
+            QueryRequest(question="深度回答", api_key="", view_only=False,
+                        retrieve_full_doc=True, full_doc_files=["a.pdf"])
+
+    def test_deep_answer_with_key_is_valid(self):
+        from internal.model.dto import QueryRequest
+        req = QueryRequest(question="深度回答", api_key="sk-xxx", view_only=False,
+                          retrieve_full_doc=True, full_doc_files=["a.pdf"])
+        assert req.api_key == "sk-xxx"
+
+
+class TestFullDocumentReconstructionFallback:
+    """面试点：父文档缺失时（存量老数据）按 chunk 聚合重建全文，
+    让「查看全文 / 深度回答」对所有文档可用，零迁移成本。"""
+
+    def test_reconstruct_when_no_parent_doc(self):
+        from internal.repository.es_repository import ESRepository
+        repo = ESRepository.__new__(ESRepository)
+        repo.index = "idx"
+        repo.vector_dim = 512
+
+        es = MagicMock()
+        # 主路（父文档）无命中，降级路（chunk 聚合）有命中
+        es.search.side_effect = [
+            {"hits": {"hits": []}},
+            {"hits": {"hits": [{"_source": {"content": "重建内容", "chunk_index": 0}}]}},
+        ]
+        repo.connect = MagicMock(return_value=es)
+        repo._get_agg_field = MagicMock(return_value="file_name")
+
+        result = repo.get_full_document("a.pdf")
+        # 降级路被触发：第二次 search 是 chunk 聚合
+        assert es.search.call_count == 2
+        assert result is not None
+        assert result["reconstructed"] is True
+        assert result["is_full_doc"] is True
+        assert "重建内容" in result["content"]
+
+    def test_reconstruct_assembles_chunks_in_order(self):
+        from internal.repository.es_repository import ESRepository
+        repo = ESRepository.__new__(ESRepository)
+        repo.index = "idx"
+        repo.vector_dim = 512
+
+        es = MagicMock()
+        es.search.side_effect = [
+            {"hits": {"hits": []}},  # 父文档无命中
+            {"hits": {"hits": [  # chunk 聚合，按 chunk_index 升序
+                {"_source": {"content": "第一段", "chunk_index": 0}},
+                {"_source": {"content": "第二段", "chunk_index": 1}},
+                {"_source": {"content": "第三段", "chunk_index": 2}},
+            ]}},
+        ]
+        repo.connect = MagicMock(return_value=es)
+        repo._get_agg_field = MagicMock(return_value="file_name")
+
+        result = repo.get_full_document("a.pdf")
+        assert result is not None
+        assert "第一段" in result["content"]
+        assert "第二段" in result["content"]
+        assert "第三段" in result["content"]
+        assert result["chunk_count"] == 3
+        assert result["reconstructed"] is True
+
+    def test_returns_none_when_no_chunks_at_all(self):
+        from internal.repository.es_repository import ESRepository
+        repo = ESRepository.__new__(ESRepository)
+        repo.index = "idx"
+        repo.vector_dim = 512
+
+        es = MagicMock()
+        es.search.return_value = {"hits": {"hits": []}}
+        repo.connect = MagicMock(return_value=es)
+        repo._get_agg_field = MagicMock(return_value="file_name")
+
+        assert repo.get_full_document("不存在.pdf") is None

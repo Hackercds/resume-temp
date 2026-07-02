@@ -230,25 +230,33 @@ app.component('chat-panel', {
                                 <span><b>{{ msg.timing.llm_s }}s</b> llm</span>
                             </div>
                             <div v-if="msg.sources && msg.sources.length" class="source-list">
-                                <div class="source-list-title">引用来源 ({{ msg.sources.length }})</div>
-                                <div v-for="(s, i) in msg.sources" :key="i"
+                                <div class="source-list-title">引用来源 ({{ dedupedSources(msg).length }} 个文档，{{ msg.sources.length }} 个片段)</div>
+                                <div v-for="(s, i) in dedupedSources(msg)" :key="s.file_name + i"
                                     class="source-item" :class="{ open: expandedMsgIdx === mIdx && expandedIdx === i }"
                                     @click="toggleSource(mIdx, i)">
                                     <div class="source-header">
                                         <div class="source-meta">
+                                            <label class="src-check" @click.stop>
+                                                <input type="checkbox" v-model="msg.selectedDocs" :value="s.file_name" />
+                                            </label>
                                             <span class="source-file">{{ s.file_name }}</span>
-                                            <span v-if="s.section_title" class="source-section">· {{ s.section_title }} ·</span>
+                                            <span v-if="s.chunk_count > 1" class="source-section">· {{ s.chunk_count }} 片段 ·</span>
                                             <span class="source-index">#{{ s.chunk_index }}</span>
                                         </div>
                                         <span class="source-score">{{ s.score }}</span>
                                     </div>
                                     <div class="source-content" v-html="renderMarkdown(s.content)"></div>
-                                    <!-- 单文档按需操作：查看全文（不调LLM，省成本）与深入回答（单文档聚焦，质量更高） -->
+                                    <!-- 查看完整文档：直接交付原文，不调 LLM（无需 API Key） -->
                                     <div v-if="!msg.isFullDoc" class="source-actions" @click.stop>
-                                        <button class="btn-source-act" @click="viewFullSource(msg, s.file_name)">📄 查看全文</button>
-                                        <button class="btn-source-act" @click="deepAnswer(msg, s.file_name)">🔍 基于此文档深入回答</button>
+                                        <button class="btn-source-act" @click="viewFullSource(msg, s.file_name)">📄 查看完整文档</button>
                                     </div>
                                 </div>
+                                <!-- 深度回答：勾选 1~N 个文档，合并完整内容调 LLM 生成 1 条综合答案 -->
+                                <button v-if="!msg.isFullDoc && dedupedSources(msg).length >= 1"
+                                    class="btn-multi-deep" :disabled="!(msg.selectedDocs && msg.selectedDocs.length)"
+                                    @click="deepAnswerMulti(msg)">
+                                    🔍 召回所选文档生成深度回答{{ msg.selectedDocs && msg.selectedDocs.length ? `（${msg.selectedDocs.length} 个）` : '（未选择）' }}
+                                </button>
                             </div>
                             <button v-if="msg.trace" class="trace-toggle" @click="msg.showTrace = !msg.showTrace">
                                 {{ msg.showTrace ? '— 收起检索过程' : '+ 查看检索过程' }}
@@ -434,6 +442,7 @@ app.component('chat-panel', {
                 trace: null,
                 showTrace: false,
                 fullDocs: [],
+                selectedDocs: [],  // 勾选的多文档（用于多文档深度召回）
                 streaming: true,  // 流式期间用纯文本显示，完成后渲染 Markdown
                 timestamp: Date.now()
             };
@@ -601,14 +610,52 @@ app.component('chat-panel', {
             this.loading = false;
             this.scrollToBottom();
         },
+        _priorQueryText(idx) {
+            // 取 idx 之前最近的用户问题作为查询文本
+            const priorUserMsgs = this.messages.slice(0, idx).filter(m => m.role === 'user');
+            if (priorUserMsgs.length >= 2) {
+                const lastTwo = priorUserMsgs.slice(-2);
+                return `${lastTwo[0].content}；${lastTwo[1].content}`;
+            }
+            return priorUserMsgs.length === 1 ? priorUserMsgs[0].content : '';
+        },
         /**
-         * 基于此文档深入回答：单文档全文作 context 调 LLM 生成详细答案。
-         * 设计价值（面试点）：多文档拼 context 会超长、稀释焦点、丢失细节；
-         * 单文档聚焦让 LLM 充分理解一份完整文档，答案更深入准确。
-         * 区别于「查看全文」：那个是原文交付（不推理），这个是深度问答（要推理）。
+         * 来源去重：同文档多切片合并成1个，保留分数最高的切片，标注片段数。
+         * 面试点：去重只在展示层，不改变后端召回与 primary 多样性结果——
+         * 其他文档仍占席位，不会「5切片合并成1」挤掉排名靠后的文档。
          */
-        async deepAnswer(lastMsg, fileName) {
-            if (!fileName) return;
+        dedupedSources(msg) {
+            const srcs = msg.sources || [];
+            const byFile = {};
+            const order = [];
+            for (const s of srcs) {
+                const fn = s.file_name || '';
+                if (!byFile[fn]) {
+                    byFile[fn] = { ...s, chunk_count: 1 };
+                    order.push(fn);
+                } else {
+                    byFile[fn].chunk_count += 1;
+                    // 保留分数最高的切片（score 可能是字符串/数字，统一转数字比较）
+                    const cur = Number(byFile[fn].score) || 0;
+                    const now = Number(s.score) || 0;
+                    if (now > cur) {
+                        byFile[fn] = { ...s, chunk_count: byFile[fn].chunk_count };
+                    }
+                }
+            }
+            return order.map(fn => byFile[fn]);
+        },
+        /**
+         * 深度回答：勾选的文档（1~N 个）合并为 1 个 context，调 LLM 生成 1 条综合答案。
+         * 选 1 个即单文档深入回答，选 N 个即跨文档综合——一个入口覆盖两种需求，
+         * 避免单文档/多文档两个雷同按钮造成困惑。区别于「查看完整文档」：那个是原文交付不推理。
+         */
+        async deepAnswerMulti(lastMsg) {
+            const files = (lastMsg.selectedDocs || []).filter(Boolean);
+            if (files.length < 1) {
+                this.$emit('notify', '请先勾选至少1个文档', 'error');
+                return;
+            }
             const idx = this.messages.indexOf(lastMsg);
             if (idx < 0) return;
             const queryText = this._priorQueryText(idx);
@@ -618,7 +665,7 @@ app.component('chat-panel', {
                 role: 'assistant',
                 content: '', sources: [], timing: null, trace_id: '',
                 trace: null, showTrace: false, fullDocs: [],
-                isFullDoc: true, targetFile: fileName, mode: 'deep',
+                isFullDoc: true, targetFile: files.join(', '), mode: 'deep_multi',
                 streaming: true, timestamp: Date.now()
             };
             this.messages.splice(idx + 1, 0, ansMsg);
@@ -636,7 +683,7 @@ app.component('chat-panel', {
                 question: queryText, api_key: this.apiConfig.apiKey,
                 provider: this.apiConfig.provider, model: this.apiConfig.model || null,
                 top_k: 5, history: [], session_id: this.currentSessionId,
-                retrieve_full_doc: true, full_doc_files: [fileName], view_only: false
+                retrieve_full_doc: true, full_doc_files: files, view_only: false
             };
             if (this.apiConfig.baseUrl) body.base_url = this.apiConfig.baseUrl;
 
@@ -666,15 +713,6 @@ app.component('chat-panel', {
             }
             this.loading = false;
             this.scrollToBottom();
-        },
-        _priorQueryText(idx) {
-            // 取 idx 之前最近的用户问题作为查询文本
-            const priorUserMsgs = this.messages.slice(0, idx).filter(m => m.role === 'user');
-            if (priorUserMsgs.length >= 2) {
-                const lastTwo = priorUserMsgs.slice(-2);
-                return `${lastTwo[0].content}；${lastTwo[1].content}`;
-            }
-            return priorUserMsgs.length === 1 ? priorUserMsgs[0].content : '';
         },
         newSession() {
             if (this.messages.length === 0) return;

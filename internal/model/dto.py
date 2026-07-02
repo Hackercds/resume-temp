@@ -6,7 +6,7 @@
 import uuid
 import time
 from typing import Optional, List, Any, Dict
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ---------- 统一响应包装 ----------
@@ -50,8 +50,9 @@ class QueryRequest(BaseModel):
     """面试点：API Key 透传，后端不存储"""
     question: str = Field(..., min_length=1, max_length=2000,
                           description="用户问题")
-    api_key: str = Field(..., min_length=1,
-                         description="LLM API Key，后端不存储，仅透传")
+    # view_only（查看完整原文）不调 LLM，无需 API Key；
+    # 仅 view_only=False（深度回答）才需要 Key。校验在 model_validator 中按需触发。
+    api_key: str = Field(default="", description="LLM API Key，后端不存储，仅透传")
     provider: str = Field(default="openai", description="LLM Provider: openai / anthropic / custom")
     model: Optional[str] = Field(default=None, description="模型名，支持自由输入")
     base_url: Optional[str] = Field(default=None, description="自定义 API 地址，如 https://api.deepseek.com/v1")
@@ -61,6 +62,18 @@ class QueryRequest(BaseModel):
     retrieve_full_doc: bool = Field(default=False, description="是否强制召回整篇文档")
     full_doc_files: Optional[List[str]] = Field(default=None, description="指定召回的文件名列表，None=召回所有来源文档")
     view_only: bool = Field(default=False, description="true=仅查看完整原文不调LLM；false=合并完整文档调LLM生成综合答案")
+
+    @model_validator(mode="after")
+    def _check_api_key_when_llm(self):
+        """
+        面试点：按需校验 API Key
+        - view_only=True：仅交付原文，不调 LLM，不需要 Key（「查看全文」对无 Key 用户也可用）
+        - view_only=False：需调 LLM 生成答案，必须有 Key
+        这样按钮字面意思与行为一致：「查看全文」= 纯展示，「深度回答」= 需推理才要 Key。
+        """
+        if not self.view_only and not self.api_key.strip():
+            raise ValueError("深度回答需要 API Key；如仅查看完整原文请用 view_only=true")
+        return self
 
 
 # ---------- 查询响应 ----------

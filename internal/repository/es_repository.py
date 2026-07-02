@@ -237,15 +237,27 @@ class ESRepository:
         return success
 
     def get_full_document(self, file_name: str) -> Optional[Dict]:
-        """通过 file_name 查询整篇文档"""
+        """
+        通过 file_name 查询整篇文档。
+
+        面试点：双路召回 + 优雅降级
+        - 主路：is_full_doc=true 的父文档（入库时写入，含完整 full_text，最干净）
+        - 降级路：父文档不存在（老数据 / 入库版本早于全文特性）时，
+          按该 file_name 聚合所有常规 chunk（chunk_index 升序）拼回全文。
+        这样「查看全文」「基于文档深度回答」对任何文档都可用，
+        而不必强制用户重新上传入库——存量数据零迁移成本。
+        """
         es = self.connect()
+        agg_field = self._get_agg_field("file_name")
+
+        # 主路：父文档
         body = {
             "size": 1,
             "query": {
                 "bool": {
                     "must": [
                         {"term": {"is_full_doc": True}},
-                        {"term": {"file_name": file_name}}
+                        {"term": {agg_field: file_name}}
                     ]
                 }
             },
@@ -253,15 +265,46 @@ class ESRepository:
         }
         response = es.search(index=self.index, body=body)
         hits = response["hits"]["hits"]
+        if hits:
+            src = hits[0]["_source"]
+            return {
+                "chunk_id": src.get("chunk_id"),
+                "content": src.get("full_text") or src.get("content", ""),
+                "file_name": src.get("file_name"),
+                "score": 0,
+                "is_full_doc": True
+            }
+
+        # 降级路：聚合该文档所有常规 chunk 拼回全文
+        return self._reconstruct_full_from_chunks(es, file_name, agg_field)
+
+    def _reconstruct_full_from_chunks(self, es, file_name: str, agg_field: str) -> Optional[Dict]:
+        """按 chunk_index 升序聚合该 file_name 的所有常规 chunk，拼回完整文档。"""
+        body = {
+            "size": 1000,
+            "query": {
+                "bool": {
+                    "must": [{"term": {agg_field: file_name}}],
+                    "must_not": [{"term": {"is_full_doc": True}}]
+                }
+            },
+            "sort": [{"chunk_index": {"order": "asc"}}],
+            "_source": ["chunk_id", "content", "file_name", "chunk_index"]
+        }
+        response = es.search(index=self.index, body=body)
+        hits = response["hits"]["hits"]
         if not hits:
             return None
-        src = hits[0]["_source"]
+        parts = [h["_source"].get("content", "") for h in hits]
+        full_text = "\n".join(p for p in parts if p)
         return {
-            "chunk_id": src.get("chunk_id"),
-            "content": src.get("full_text") or src.get("content", ""),
-            "file_name": src.get("file_name"),
+            "chunk_id": f"{file_name}__reconstructed",
+            "content": full_text,
+            "file_name": file_name,
             "score": 0,
-            "is_full_doc": True
+            "is_full_doc": True,
+            "reconstructed": True,
+            "chunk_count": len(hits)
         }
 
     # ---------- 数据检索 ----------
