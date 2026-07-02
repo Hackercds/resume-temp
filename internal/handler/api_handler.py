@@ -173,7 +173,9 @@ async def rag_query(request: Request, body: QueryRequest):
             base_url=body.base_url,
             top_k=body.top_k,
             history=[m.model_dump() for m in body.history] if body.history else None,
-            retrieve_full_doc=body.retrieve_full_doc
+            retrieve_full_doc=body.retrieve_full_doc,
+            full_doc_files=body.full_doc_files,
+            view_only=body.view_only
         )
 
         # 构造 sources
@@ -240,7 +242,9 @@ async def rag_query_stream(request: Request, body: QueryRequest):
                 base_url=body.base_url,
                 top_k=body.top_k,
                 history=[m.model_dump() for m in body.history] if body.history else None,
-                retrieve_full_doc=body.retrieve_full_doc
+                retrieve_full_doc=body.retrieve_full_doc,
+                full_doc_files=body.full_doc_files,
+                view_only=body.view_only
             ):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         except Exception as e:

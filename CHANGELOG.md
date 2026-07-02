@@ -303,3 +303,41 @@
 ### Fixed
 - 多部分问题返回多个答案拼接（5个答案）的级联重新生成
 - 流式标记被拆开后片段泄露给用户（如 `{{retrieve_full_doc`）
+
+## [1.7.0] - 2026-07-02
+
+### 单文档按需操作：查看全文 vs 深入回答
+
+#### 问题诊断
+- 旧「召回完整文档」按钮一次性召回所有来源文档，每个文档生成一条答案，
+  多文档问题出现多个答案拼接；且无法按需查看单个文档
+- 缺乏「只看原文不调LLM」的轻量入口（核对细节/找原文出处不需推理，应省成本）
+
+#### 设计（经得住面试官追问的价值论证）
+RAG 本质是检索+生成，但「完整文档」场景有两种截然不同的用户意图：
+- 查看原文：用户要核对细节/找原文出处 → 不需要 LLM 推理，直接流式返回原文。
+  价值：零 API 成本、即时显示、不丢细节、不幻觉
+- 深入回答：当前 chunk 答得太浅，要基于完整文档的详细回答 → 调 LLM，但只针对
+  单文档（多文档拼 context 会超长、稀释焦点、丢失细节，单文档聚焦质量更高）
+
+#### 实现
+- 后端 query/query_stream 新增 `full_doc_files`（指定召回文件）与 `view_only` 参数：
+  - view_only=True：流式返回文档原文，不调 LLM（按需加载源文件）
+  - view_only=False：单文档全文作 context 调 LLM 生成 1 条详细答案
+- 前端移除底部「召回完整文档」按钮，改为每个来源卡片两个按钮：
+  - 📄 查看全文（view_only=true）
+  - 🔍 基于此文档深入回答（view_only=false，单文档聚焦）
+- DTO/api_handler 透传 full_doc_files、view_only
+
+### Added
+- DTO: QueryRequest 新增 full_doc_files、view_only
+- rag_service: query/query_stream 支持 full_doc_files 指定召回文件 + view_only 模式
+- 前端 viewFullSource / deepAnswer / _priorQueryText 方法
+- 2 个专项测试：view_only 不调 LLM、deep_answer 单文档调 LLM
+
+### Changed
+- 移除前端底部「召回完整文档」按钮（一次性所有文档）
+- 来源卡片新增「查看全文」「深入回答」两个按钮
+
+### Tests
+- 全量 117 个测试通过（原 115 + 新增 2）

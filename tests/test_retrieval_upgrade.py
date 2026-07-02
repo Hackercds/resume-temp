@@ -1196,7 +1196,7 @@ class TestFullDocStreamShortCircuit:
 
         events = []
         async for ev in rag.query_stream(question="测试", api_key="sk",
-                                         retrieve_full_doc=True, top_k=5):
+                                         retrieve_full_doc=True, view_only=True, top_k=5):
             events.append(ev)
 
         # LLM 流式不应被调用（短路返回原文）
@@ -1271,3 +1271,98 @@ class TestStreamMarkFilter:
         rag = self._new_rag()
         out = rag._filter_stream_marks("{{retrieve_full_doc:a.pdf}}{{retrieve_full_doc:b.pdf}}")
         assert "retrieve_full_doc" not in out
+
+
+# ==================== 单文档按需操作：查看全文 vs 深入回答 ====================
+class TestSingleDocActions:
+    """view_full_source（不调LLM）与 deep_answer（调LLM单文档聚焦）"""
+
+    @pytest.mark.asyncio
+    @patch('internal.service.rag_service.EmbeddingService')
+    @patch('internal.service.rag_service.ESService')
+    @patch('internal.service.rag_service.LLMService')
+    async def test_view_only_returns_raw_no_llm(self, mock_llm, mock_es, mock_emb):
+        """view_only=True 仅查看原文：流式返回文档原文，不调 LLM"""
+        import numpy as np
+        from internal.service.rag_service import RAGService
+
+        mock_emb_instance = MagicMock()
+        mock_emb_instance.encode_query.return_value = np.random.randn(512).astype(np.float32)
+        mock_emb.return_value = mock_emb_instance
+
+        mock_es_instance = MagicMock()
+        mock_es_instance.search_hybrid.return_value = [
+            {"chunk_id": "c1", "content": "x", "file_name": "a.pdf", "chunk_index": 0, "score": 0.5}
+        ]
+        mock_es_instance.expand_neighbors.side_effect = lambda c, **kw: c
+        mock_es_instance.list_file_names.return_value = []
+        mock_es_instance.retrieve_full_document.return_value = {
+            "chunk_id": "a.pdf__full", "content": "原文内容第一段。第二段。",
+            "file_name": "a.pdf", "score": 0, "is_full_doc": True
+        }
+        mock_es.return_value = mock_es_instance
+
+        mock_llm_instance = MagicMock()
+        mock_llm_instance.generate_stream = MagicMock()
+        mock_llm.return_value = mock_llm_instance
+
+        rag = RAGService(embedding_service=mock_emb_instance,
+                         es_service=mock_es_instance, llm_service=mock_llm_instance)
+        events = []
+        async for ev in rag.query_stream(question="q", api_key="sk",
+                                         retrieve_full_doc=True, view_only=True,
+                                         full_doc_files=["a.pdf"], top_k=5):
+            events.append(ev)
+
+        # LLM 不应被调用（原文交付，零 API 成本）
+        mock_llm_instance.generate_stream.assert_not_called()
+        # retrieve_full_document 被指定文件调用
+        mock_es_instance.retrieve_full_document.assert_called_with("a.pdf")
+        tokens = "".join(e["content"] for e in events if e["type"] == "token")
+        assert "原文内容第一段" in tokens
+
+    @pytest.mark.asyncio
+    @patch('internal.service.rag_service.EmbeddingService')
+    @patch('internal.service.rag_service.ESService')
+    @patch('internal.service.rag_service.LLMService')
+    async def test_deep_answer_calls_llm_single_doc(self, mock_llm, mock_es, mock_emb):
+        """view_only=False 深入回答：单文档全文作 context 调 LLM 生成详细答案"""
+        import numpy as np
+        from internal.service.rag_service import RAGService
+
+        mock_emb_instance = MagicMock()
+        mock_emb_instance.encode_query.return_value = np.random.randn(512).astype(np.float32)
+        mock_emb.return_value = mock_emb_instance
+
+        mock_es_instance = MagicMock()
+        mock_es_instance.search_hybrid.return_value = [
+            {"chunk_id": "c1", "content": "x", "file_name": "a.pdf", "chunk_index": 0, "score": 0.5}
+        ]
+        mock_es_instance.expand_neighbors.side_effect = lambda c, **kw: c
+        mock_es_instance.list_file_names.return_value = []
+        mock_es_instance.retrieve_full_document.return_value = {
+            "chunk_id": "a.pdf__full", "content": "完整文档内容",
+            "file_name": "a.pdf", "score": 0, "is_full_doc": True
+        }
+        mock_es.return_value = mock_es_instance
+
+        # LLM 流式返回详细答案
+        async def gen_stream(*a, **kw):
+            for t in ["基于", "完整文档", "的详细", "答案"]:
+                yield t
+        mock_llm_instance = MagicMock()
+        mock_llm_instance.generate_stream = gen_stream
+        mock_llm.return_value = mock_llm_instance
+
+        rag = RAGService(embedding_service=mock_emb_instance,
+                         es_service=mock_es_instance, llm_service=mock_llm_instance)
+        events = []
+        async for ev in rag.query_stream(question="q", api_key="sk",
+                                         retrieve_full_doc=True, view_only=False,
+                                         full_doc_files=["a.pdf"], top_k=5):
+            events.append(ev)
+
+        tokens = "".join(e["content"] for e in events if e["type"] == "token")
+        assert tokens == "基于完整文档的详细答案"
+        # 只召回指定文档，不是所有 primary
+        mock_es_instance.retrieve_full_document.assert_called_once_with("a.pdf")

@@ -196,7 +196,9 @@ class RAGService:
               provider: str = "openai", model: str = None,
               base_url: str = None, top_k: int = 5,
               history: List[Dict] = None,
-              retrieve_full_doc: bool = False) -> Dict:
+              retrieve_full_doc: bool = False,
+              full_doc_files: List[str] = None,
+              view_only: bool = False) -> Dict:
         """
         RAG 查询主流程 - 面试点：全链路耗时分布
         """
@@ -377,10 +379,24 @@ class RAGService:
 
             # Step 8: 用户手动触发整篇文档召回（替换 primary 为完整文档）
             if retrieve_full_doc and get_config().retrieval.enable_full_document:
-                full_docs = self._retrieve_full_documents(
-                    list({c["file_name"] for c in primary})
-                )
+                target = full_doc_files if full_doc_files else \
+                        list({c["file_name"] for c in primary})
+                full_docs = self._retrieve_full_documents(target)
                 if full_docs:
+                    if view_only:
+                        # 仅查看原文：直接返回文档原文，不调 LLM（省成本、即时）
+                        answer = "\n\n".join(
+                            f"📄 {d.get('file_name','')}\n\n{d.get('content','')}"
+                            for d in full_docs if d.get('content')
+                        )
+                        primary = full_docs
+                        timing["llm_s"] = 0.0
+                        timing["full_doc_retrieval"] = True
+                        trace["full_doc_requested"] = True
+                        trace["full_doc_files"] = [d.get("file_name") for d in full_docs]
+                        return self._build_success_response(
+                            question, answer, primary, trace_id, timing, trace)
+                    # view_only=False：合并完整文档为 context 调 LLM 生成综合答案
                     primary = full_docs
 
             # Step 9: 邻域上下文扩展 → context_candidates（primary + 邻居）
@@ -640,7 +656,9 @@ class RAGService:
                            provider: str = "openai", model: str = None,
                            base_url: str = None, top_k: int = 5,
                            history: List[Dict] = None,
-                           retrieve_full_doc: bool = False):
+                           retrieve_full_doc: bool = False,
+                           full_doc_files: List[str] = None,
+                           view_only: bool = False):
         """
         流式 RAG 查询 - 前 7 步同步执行，第 8 步流式生成 LLM token。
         yield SSE 事件字典：{"type": "token"/"done"/"error", ...}
@@ -804,51 +822,82 @@ class RAGService:
 
             # Step 8: 用户手动触发整篇文档召回
             if retrieve_full_doc and get_config().retrieval.enable_full_document:
-                full_docs = self._retrieve_full_documents(
-                    list({c["file_name"] for c in primary})
-                )
+                # 支持指定文件列表（用户勾选）；None=召回所有 primary 来源文档
+                target = full_doc_files if full_doc_files else \
+                         list({c["file_name"] for c in primary})
+                full_docs = self._retrieve_full_documents(target)
                 if full_docs:
-                    # 短路：直接流式返回文档原文，不调 LLM
-                    # 面试点：为什么完整文档召回不调 LLM？
-                    # 答：完整文档 context 可能几万字，LLM 处理超长 context 极慢（10-30s），
-                    # 且用户要的是文档原文而非总结。直接分块 yield 原文，零 LLM 延迟，
-                    # 前端即时显示，彻底解决「召回完整文档耗时长、前端卡死」。
-                    answer_parts = []
-                    for doc in full_docs:
-                        fn = doc.get("file_name", "")
-                        content = doc.get("content", "") or ""
-                        if not content:
-                            continue
-                        header = f"📄 {fn}\n\n"
-                        answer_parts.append(header)
-                        yield {"type": "token", "content": header}
-                        # 按段落分块流式输出，每块 ~200 字，即时反馈
-                        chunks = self._split_for_stream(content, 200)
-                        for piece in chunks:
-                            answer_parts.append(piece)
-                            yield {"type": "token", "content": piece}
-                    answer = "".join(answer_parts)
-                    timing["llm_s"] = 0.0
-                    timing["full_doc_retrieval"] = True
                     trace["full_doc_requested"] = True
                     trace["full_doc_files"] = [d.get("file_name") for d in full_docs]
+                    timing["full_doc_retrieval"] = True
+
+                    if view_only:
+                        # 模式1：仅查看完整原文，不调 LLM（按需加载源文件，零 API 成本）
+                        answer_parts = []
+                        for doc in full_docs:
+                            fn = doc.get("file_name", "")
+                            content = doc.get("content", "") or ""
+                            if not content:
+                                continue
+                            header = f"📄 {fn}\n\n"
+                            answer_parts.append(header)
+                            yield {"type": "token", "content": header}
+                            chunks = self._split_for_stream(content, 200)
+                            for piece in chunks:
+                                answer_parts.append(piece)
+                                yield {"type": "token", "content": piece}
+                        answer = "".join(answer_parts)
+                        timing["llm_s"] = 0.0
+                        yield {
+                            "type": "done",
+                            "answer": answer,
+                            "sources": [
+                                {"content": d.get("content", "")[:500],
+                                 "file_name": d.get("file_name", ""), "score": 0,
+                                 "section_title": "", "chunk_index": -1,
+                                 "is_full_doc": True}
+                                for d in full_docs
+                            ],
+                            "trace_id": trace_id, "timing": timing, "trace": trace,
+                        }
+                        return
+
+                    # 模式2：合并完整文档为 context，调 LLM 生成 1 条综合详细答案
+                    # （用户勾选文档后，把所有选中文档的完整内容拼成 context，
+                    #   让 LLM 基于全部完整信息生成一个详细完整的答案，而非每文档单独生成）
+                    full_context = self._build_context(full_docs)
+                    llm_start = time.time()
+                    answer_parts = []
+                    try:
+                        async for token in self.llm.generate_stream(
+                            question=question, context=full_context,
+                            api_key=api_key, provider=provider, model=model,
+                            base_url=base_url, history=compressed_history,
+                            allow_full_doc_retrieval=False
+                        ):
+                            cleaned_token = self._filter_stream_marks(token)
+                            if cleaned_token:
+                                answer_parts.append(cleaned_token)
+                                yield {"type": "token", "content": cleaned_token}
+                    except LLMAPIError as e:
+                        self.logger.error(trace_id, "rag_service", "完整文档综合生成失败", error=str(e))
+                        yield {"type": "error", "message": f"完整文档生成失败: {str(e)}", "trace_id": trace_id}
+                        return
+                    answer = "".join(answer_parts)
+                    answer = self._strip_retrieve_marks(answer)
+                    timing["llm_s"] = round(time.time() - llm_start, 1)
+                    primary = full_docs
                     yield {
                         "type": "done",
                         "answer": answer,
                         "sources": [
-                            {
-                                "content": d.get("content", "")[:500],
-                                "file_name": d.get("file_name", ""),
-                                "score": 0,
-                                "section_title": "",
-                                "chunk_index": -1,
-                                "is_full_doc": True,
-                            }
+                            {"content": d.get("content", "")[:500],
+                             "file_name": d.get("file_name", ""), "score": 0,
+                             "section_title": "", "chunk_index": -1,
+                             "is_full_doc": True}
                             for d in full_docs
                         ],
-                        "trace_id": trace_id,
-                        "timing": timing,
-                        "trace": trace,
+                        "trace_id": trace_id, "timing": timing, "trace": trace,
                     }
                     return
 

@@ -243,16 +243,17 @@ app.component('chat-panel', {
                                         <span class="source-score">{{ s.score }}</span>
                                     </div>
                                     <div class="source-content" v-html="renderMarkdown(s.content)"></div>
+                                    <!-- 单文档按需操作：查看全文（不调LLM，省成本）与深入回答（单文档聚焦，质量更高） -->
+                                    <div v-if="!msg.isFullDoc" class="source-actions" @click.stop>
+                                        <button class="btn-source-act" @click="viewFullSource(msg, s.file_name)">📄 查看全文</button>
+                                        <button class="btn-source-act" @click="deepAnswer(msg, s.file_name)">🔍 基于此文档深入回答</button>
+                                    </div>
                                 </div>
                             </div>
                             <button v-if="msg.trace" class="trace-toggle" @click="msg.showTrace = !msg.showTrace">
                                 {{ msg.showTrace ? '— 收起检索过程' : '+ 查看检索过程' }}
                             </button>
                             <pre v-if="msg.trace && msg.showTrace" class="trace-content">{{ JSON.stringify(msg.trace, null, 2) }}</pre>
-                            <button v-if="msg.sources && msg.sources.length && !msg.isFullDoc"
-                                class="btn-full-doc" @click="retrieveFullDoc(msg)">
-                                召回完整文档
-                            </button>
                             <div v-if="msg.fullDocs && msg.fullDocs.length" class="full-doc-card">
                                 <div v-for="(fd, fi) in msg.fullDocs" :key="fi">
                                     <div class="full-doc-header">
@@ -532,104 +533,148 @@ app.component('chat-panel', {
             }
         },
         async retrieveFullDoc(lastMsg) {
+            // 保留旧入口兼容（若被外部调用），内部转 viewFullSource 全部
             if (!lastMsg || !lastMsg.sources || !lastMsg.sources.length) return;
+            const files = [...new Set(lastMsg.sources.map(s => s.file_name))];
+            for (const fn of files) await this.viewFullSource(lastMsg, fn);
+        },
+        /**
+         * 查看完整源文件：不调 LLM，流式返回文档原文。
+         * 设计价值（面试点）：原文交付不需要 LLM 推理，零 API 成本、即时显示；
+         * 用户核对细节/找原文出处时，原文比 LLM 总结更可靠（不丢细节、不幻觉）。
+         */
+        async viewFullSource(lastMsg, fileName) {
+            if (!fileName) return;
             const idx = this.messages.indexOf(lastMsg);
             if (idx < 0) return;
+            const queryText = this._priorQueryText(idx);
 
-            const priorUserMsgs = this.messages.slice(0, idx).filter(m => m.role === 'user');
-            let queryText = '';
-            if (priorUserMsgs.length >= 2) {
-                const lastTwo = priorUserMsgs.slice(-2);
-                queryText = `${lastTwo[0].content}；${lastTwo[1].content}`;
-            } else if (priorUserMsgs.length === 1) {
-                queryText = priorUserMsgs[0].content;
-            }
-            if (!queryText) return;
+            const fullDocMsg = {
+                id: Date.now() + Math.random(),
+                role: 'assistant',
+                content: '', sources: [], timing: null, trace_id: '',
+                trace: null, showTrace: false, fullDocs: [],
+                isFullDoc: true, targetFile: fileName, mode: 'view',
+                streaming: true, timestamp: Date.now()
+            };
+            this.messages.splice(idx + 1, 0, fullDocMsg);
+            const ref = this.messages[idx + 1];
+            this.loading = true; this.error = '';
 
-            const targetFiles = [...new Set(lastMsg.sources.map(s => s.file_name))];
-            if (!targetFiles.length) return;
-
-            this.loading = true; this.error = ''; this.errorSuggestion = ''; this.errorRetryable = false; this.emptyRetrieval = false;
-
-            // 滚动节流（流式期间合并到一帧一次，避免长文档卡顿）
             let scrollRaf = null;
             const throttledScroll = () => {
                 if (scrollRaf === null) {
-                    scrollRaf = requestAnimationFrame(() => {
-                        scrollRaf = null;
-                        this.scrollToBottom();
-                    });
+                    scrollRaf = requestAnimationFrame(() => { scrollRaf = null; this.scrollToBottom(); });
                 }
             };
 
-            // 并发召回多个文档（不串行 await 阻塞 UI）
-            const fetchOne = (fileName, insertIdx) => {
-                const fullDocMsg = {
-                    id: Date.now() + Math.random(),
-                    role: 'assistant',
-                    content: '',
-                    sources: [],
-                    timing: null,
-                    trace_id: '',
-                    trace: null,
-                    showTrace: false,
-                    fullDocs: [],
-                    isFullDoc: true,
-                    targetFile: fileName,
-                    streaming: true,
-                    timestamp: Date.now()
-                };
-                this.messages.splice(insertIdx, 0, fullDocMsg);
-                // 同 doQuery：取回 reactive 引用，否则修改原始对象不触发响应式更新
-                const fullDocMsgRef = this.messages[insertIdx];
+            const body = {
+                question: queryText, api_key: this.apiConfig.apiKey,
+                provider: this.apiConfig.provider, model: this.apiConfig.model || null,
+                top_k: 5, history: [], session_id: this.currentSessionId,
+                retrieve_full_doc: true, full_doc_files: [fileName], view_only: true
+            };
+            if (this.apiConfig.baseUrl) body.base_url = this.apiConfig.baseUrl;
 
-                const body = {
-                    question: queryText,
-                    api_key: this.apiConfig.apiKey,
-                    provider: this.apiConfig.provider,
-                    model: this.apiConfig.model || null,
-                    top_k: 5,
-                    history: [],
-                    session_id: this.currentSessionId,
-                    retrieve_full_doc: true
-                };
-                if (this.apiConfig.baseUrl) body.base_url = this.apiConfig.baseUrl;
-
-                return ApiClient.queryStream(
-                    body,
-                    (token) => {
-                        fullDocMsgRef.content += token;
-                        throttledScroll();
-                    },
+            try {
+                await ApiClient.queryStream(body,
+                    (token) => { ref.content += token; throttledScroll(); },
                     (data) => {
                         const ans = data.answer || '';
-                        if (ans && ans.length > (fullDocMsgRef.content || '').length) {
-                            fullDocMsgRef.content = ans;
-                        } else if (!fullDocMsgRef.content) {
-                            fullDocMsgRef.content = ans;
-                        }
-                        fullDocMsgRef.sources = data.sources || [];
-                        fullDocMsgRef.timing = data.timing || null;
-                        fullDocMsgRef.trace_id = data.trace_id || '';
-                        fullDocMsgRef.trace = data.trace || null;
-                        fullDocMsgRef.streaming = false;
+                        if (ans && ans.length > (ref.content || '').length) ref.content = ans;
+                        else if (!ref.content) ref.content = ans;
+                        ref.sources = data.sources || [];
+                        ref.timing = data.timing || null;
+                        ref.streaming = false;
                         this.saveSession();
                     },
                     (err) => {
-                        fullDocMsgRef.content = `⚠ ${err.message}`;
-                        fullDocMsgRef.streaming = false;
+                        ref.content = `⚠ ${err.message}`;
+                        ref.streaming = false;
                         this.$emit('notify', err.message, 'error');
                     }
                 );
-            };
-
-            // 并发执行，每个文档插入到 idx+1 之后递增位置
-            const tasks = targetFiles.map((fn, i) => fetchOne(fn, idx + 1 + i));
-            await Promise.all(tasks);
-
-            this.$emit('notify', `已召回完整文档：${targetFiles.join(', ')}`);
+            } catch (e) {
+                ref.content = `⚠ ${e.message}`;
+                ref.streaming = false;
+            }
             this.loading = false;
             this.scrollToBottom();
+        },
+        /**
+         * 基于此文档深入回答：单文档全文作 context 调 LLM 生成详细答案。
+         * 设计价值（面试点）：多文档拼 context 会超长、稀释焦点、丢失细节；
+         * 单文档聚焦让 LLM 充分理解一份完整文档，答案更深入准确。
+         * 区别于「查看全文」：那个是原文交付（不推理），这个是深度问答（要推理）。
+         */
+        async deepAnswer(lastMsg, fileName) {
+            if (!fileName) return;
+            const idx = this.messages.indexOf(lastMsg);
+            if (idx < 0) return;
+            const queryText = this._priorQueryText(idx);
+
+            const ansMsg = {
+                id: Date.now() + Math.random(),
+                role: 'assistant',
+                content: '', sources: [], timing: null, trace_id: '',
+                trace: null, showTrace: false, fullDocs: [],
+                isFullDoc: true, targetFile: fileName, mode: 'deep',
+                streaming: true, timestamp: Date.now()
+            };
+            this.messages.splice(idx + 1, 0, ansMsg);
+            const ref = this.messages[idx + 1];
+            this.loading = true; this.error = '';
+
+            let scrollRaf = null;
+            const throttledScroll = () => {
+                if (scrollRaf === null) {
+                    scrollRaf = requestAnimationFrame(() => { scrollRaf = null; this.scrollToBottom(); });
+                }
+            };
+
+            const body = {
+                question: queryText, api_key: this.apiConfig.apiKey,
+                provider: this.apiConfig.provider, model: this.apiConfig.model || null,
+                top_k: 5, history: [], session_id: this.currentSessionId,
+                retrieve_full_doc: true, full_doc_files: [fileName], view_only: false
+            };
+            if (this.apiConfig.baseUrl) body.base_url = this.apiConfig.baseUrl;
+
+            try {
+                await ApiClient.queryStream(body,
+                    (token) => { ref.content += token; throttledScroll(); },
+                    (data) => {
+                        const ans = data.answer || '';
+                        if (ans && ans.length > (ref.content || '').length) ref.content = ans;
+                        else if (!ref.content) ref.content = ans;
+                        ref.sources = data.sources || [];
+                        ref.timing = data.timing || null;
+                        ref.trace_id = data.trace_id || '';
+                        ref.trace = data.trace || null;
+                        ref.streaming = false;
+                        this.saveSession();
+                    },
+                    (err) => {
+                        ref.content = `⚠ ${err.message}`;
+                        ref.streaming = false;
+                        this.$emit('notify', err.message, 'error');
+                    }
+                );
+            } catch (e) {
+                ref.content = `⚠ ${e.message}`;
+                ref.streaming = false;
+            }
+            this.loading = false;
+            this.scrollToBottom();
+        },
+        _priorQueryText(idx) {
+            // 取 idx 之前最近的用户问题作为查询文本
+            const priorUserMsgs = this.messages.slice(0, idx).filter(m => m.role === 'user');
+            if (priorUserMsgs.length >= 2) {
+                const lastTwo = priorUserMsgs.slice(-2);
+                return `${lastTwo[0].content}；${lastTwo[1].content}`;
+            }
+            return priorUserMsgs.length === 1 ? priorUserMsgs[0].content : '';
         },
         newSession() {
             if (this.messages.length === 0) return;

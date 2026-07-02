@@ -541,6 +541,25 @@ h1, h2, h3, h4 { font-weight: 600; color: var(--text); line-height: 1.35; }
 }
 .source-item.open .source-content { max-height: 400px; overflow-y: auto; padding-bottom: 4px; }
 
+/* 来源卡片操作按钮：查看全文（不调LLM）/ 基于此文档深入回答 */
+.source-actions {
+    margin-top: 8px;
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+.btn-source-act {
+    font-size: 12px;
+    padding: 4px 10px;
+    border: 1px solid var(--border);
+    background: var(--bg-soft);
+    color: var(--text-2);
+    border-radius: var(--r-1);
+    cursor: pointer;
+    transition: all 150ms ease;
+}
+.btn-source-act:hover { background: var(--mint-50); border-color: var(--mint-400); color: var(--mint-700); }
+
 /* Trace toggle */
 .trace-toggle {
     margin-top: 10px;

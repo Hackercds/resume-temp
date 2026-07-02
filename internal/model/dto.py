@@ -59,6 +59,8 @@ class QueryRequest(BaseModel):
     history: List[ChatMessage] = Field(default_factory=list, description="历史对话消息")
     session_id: Optional[str] = Field(default=None, description="会话ID，可选")
     retrieve_full_doc: bool = Field(default=False, description="是否强制召回整篇文档")
+    full_doc_files: Optional[List[str]] = Field(default=None, description="指定召回的文件名列表，None=召回所有来源文档")
+    view_only: bool = Field(default=False, description="true=仅查看完整原文不调LLM；false=合并完整文档调LLM生成综合答案")
 
 
 # ---------- 查询响应 ----------
