@@ -16,6 +16,8 @@ const app = createApp({
             baseUrl: localStorage.getItem('rag_base_url') || ''
         });
         const rememberKey = ref(localStorage.getItem('rag_remember_key') !== 'false');
+        // 召回深度：与 config-card 子组件通过 retrieval-depth-changed 事件保持同步
+        const retrievalDepth = ref(Number(localStorage.getItem('rag_retrieval_depth') || 10));
         const llmPresets = ref([]);
         const defaultApiKeyConfigured = ref(false);
 
@@ -120,8 +122,9 @@ const app = createApp({
         </nav>
 
         <div v-show="activeTab === 'chat'">
-            <chat-panel :api-config="apiConfig" :health="health"
-                @notify="showNotification" @switch-tab="activeTab = $event" />
+            <chat-panel :api-config="apiConfig" :health="health" :retrieval-depth="retrievalDepth"
+                @notify="showNotification" @switch-tab="activeTab = $event"
+                @retrieval-depth-changed="retrievalDepth = $event" />
         </div>
         <div v-show="activeTab === 'knowledge'">
             <knowledge-panel :health="health" @notify="showNotification" />
@@ -169,6 +172,17 @@ app.component('api-key-config', {
                 <option v-for="m in modelDatalist" :value="m" />
             </datalist>
         </div>
+        <!-- 召回深度档：用户控制 RAG top_k（5 轻量 / 10 标准 / 15 深度 / 20 极深）
+             值越大多样性覆盖越广、上下文越全，但 LLM token 也越多 -->
+        <div class="depth-row">
+            <label>召回深度</label>
+            <select :value="retrievalDepth" @change="retrievalDepth = Number($event.target.value); saveRetrievalDepth()">
+                <option :value="5">轻量 (5 条 · 快速)</option>
+                <option :value="10">标准 (10 条 · 均衡)</option>
+                <option :value="15">深度 (15 条 · 详细)</option>
+                <option :value="20">极深 (20 条 · 全面)</option>
+            </select>
+        </div>
         <!-- 自定义 Base URL：custom provider 或选了带 base_url 的预设时露出。
              没填时后端走 OpenAI/Anthropic 官方；填了就走用户指定（OpenAI 兼容协议）。 -->
         <div v-if="showBaseUrl" class="baseurl-row">
@@ -191,7 +205,7 @@ app.component('api-key-config', {
         </label>
     </div>
     `,
-    data() { return { showKey: false }; },
+    data() { return { showKey: false, retrievalDepth: Number(localStorage.getItem('rag_retrieval_depth') || 10) }; },
     computed: {
         // Base URL 露出条件：custom provider，或当前选了带 base_url 的预设
         showBaseUrl() {
@@ -205,6 +219,10 @@ app.component('api-key-config', {
     },
     methods: {
         update(key, val) { this.apiConfig[key] = val; },
+        saveRetrievalDepth() {
+            localStorage.setItem('rag_retrieval_depth', String(this.retrievalDepth));
+            this.$emit('retrieval-depth-changed', this.retrievalDepth);
+        },
         applyPreset(name) {
             const p = (this.llmPresets || []).find(x => x.name === name);
             if (!p) return;
@@ -218,7 +236,7 @@ app.component('api-key-config', {
 
 // ==================== 问答面板 ====================
 app.component('chat-panel', {
-    props: ['apiConfig', 'health'],
+    props: ['apiConfig', 'health', 'retrievalDepth'],
     emits: ['notify', 'switch-tab'],
     template: `
     <div>
@@ -559,7 +577,7 @@ app.component('chat-panel', {
                     api_key: this.apiConfig.apiKey,
                     provider: this.apiConfig.provider,
                     model: this.apiConfig.model || null,
-                    top_k: 5,
+                    top_k: this.retrievalDepth || 10,
                     history,
                     session_id: this.currentSessionId,
                     retrieve_full_doc: retrieveFullDoc
@@ -682,7 +700,7 @@ app.component('chat-panel', {
             const body = {
                 question: queryText, api_key: this.apiConfig.apiKey,
                 provider: this.apiConfig.provider, model: this.apiConfig.model || null,
-                top_k: 5, history: [], session_id: this.currentSessionId,
+                top_k: this.retrievalDepth || 10, history: [], session_id: this.currentSessionId,
                 retrieve_full_doc: true, full_doc_files: [fileName], view_only: true
             };
             if (this.apiConfig.baseUrl) body.base_url = this.apiConfig.baseUrl;
@@ -785,7 +803,7 @@ app.component('chat-panel', {
             const body = {
                 question: queryText, api_key: this.apiConfig.apiKey,
                 provider: this.apiConfig.provider, model: this.apiConfig.model || null,
-                top_k: 5, history: [], session_id: this.currentSessionId,
+                top_k: this.retrievalDepth || 10, history: [], session_id: this.currentSessionId,
                 retrieve_full_doc: true, full_doc_files: files, view_only: false
             };
             if (this.apiConfig.baseUrl) body.base_url = this.apiConfig.baseUrl;

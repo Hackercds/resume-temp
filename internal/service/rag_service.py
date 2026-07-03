@@ -272,17 +272,19 @@ class RAGService:
             expanded_question = rewritten.get("expanded", question)
             compressed_history = self._compress_history(history, threshold=cfg.summary_threshold)
 
-            # 多轮盲点修复：历次 assistant 引用的文件名也作为检索锚点
-            # —— 比如用户问"我上一轮说的 15-17 日是哪个文档写的"，光靠 context_question
-            #   不一定能命中（因为文件名 token 在历史 messages 里），拼接到 BM25 query 里可拉回原文档
+            # 多轮盲点修复（v1.6 改造）：把历次 assistant 引用的文件作为**独立附加召回**，
+            # 不再拼进主 query（避免污染本轮 query 的 BM25/向量空间，导致本轮问题被稀释）。
+            # 做法：用 anchor_query 单独召回，与主召回 union 到 candidates，不参与主 RRF 评分。
             history_quoted_files = rewritten.get("history_quoted_files", [])
             trace["history_quoted_files"] = history_quoted_files
+            # 锚点只在对话式追问时才追加（follow_up / clarify / summarize），new_topic 不污染
+            self._history_anchor_query = None
             if history_quoted_files and intent in ("follow_up", "clarify", "summarize"):
-                file_anchor = " ".join(
-                    [s.replace(".pdf", "").replace(".md", "").replace("-", " ") for s in history_quoted_files]
+                # 把文件名拆成关键词（去掉扩展名和分隔符），避免拼长串稀释
+                self._history_anchor_query = " ".join(
+                    s.replace(".pdf", "").replace(".md", "").replace("-", " ")
+                    for s in history_quoted_files
                 )
-                rewritten_question = f"{rewritten_question}\n\n历次对话引用源关键词：{file_anchor}"
-                expanded_question = f"{expanded_question}\n\n历次对话引用源关键词：{file_anchor}"
 
             self.logger.info(trace_id, "rag_service",
                              "意图识别完成",
@@ -336,6 +338,25 @@ class RAGService:
                         min_score=get_config().retrieval.min_score
                     )
                     candidates = self._merge_candidates(candidates, expanded_candidates)
+
+                # 多轮锚点召回：独立搜索历史引用的文件，不污染本轮 query
+                # —— 给 BM25 一个 file-name-only query，结果与主召回 union
+                # —— 多样性策略会基于全 candidate 重新排序，让本轮相关仍然占主
+                # —— 锚点命中的文档作为"万一主召回没拉到它"的兜底（多轮盲点修复的最后一个环节）
+                if getattr(self, "_history_anchor_query", None):
+                    anchor_results = self.es.search_hybrid(
+                        query_vector, query_text=self._history_anchor_query,
+                        top_k=min(top_k, 10),
+                        min_score=get_config().retrieval.min_score
+                    )
+                    if anchor_results:
+                        candidates = self._merge_candidates(candidates, anchor_results)
+                        trace["history_anchor_hits"] = [
+                            {"file_name": c.get("file_name"),
+                             "score": round(c.get("score", 0), 3)}
+                            for c in anchor_results[:5]
+                        ]
+                self._history_anchor_query = None  # 清理，避免污染下一轮
 
             except ESConnectionError as e:
                 self.logger.error(trace_id, "rag_service", "ES 连接失败", error=str(e))
@@ -1140,7 +1161,14 @@ class RAGService:
         if not candidates:
             return ""
 
-        budget = max(1000, get_config().retrieval.context_char_budget)
+        # 内容预算：随 top_k 缩放（深度档 20 时给到 12k 字符，5 时 6k），不超 LLM 上下文窗口
+        # 设计点：top_k 越大，每条分到的额度越少（被切到 6000/20=300 字/条仍可用）；
+        # 若用户真的想要全文，可走 retrieve_full_doc 路径（view_only=true），不在此预算内
+        base_budget = max(1000, get_config().retrieval.context_char_budget)
+        per_doc_base = base_budget
+        n = max(1, len(candidates))
+        budget = int(base_budget * max(1.0, n / 5.0))
+        budget = min(budget, 16000)  # hard cap, 防 LLM 上下文溢出
         # 排序：主命中（有分）优先，邻域块（零分）按 file_name + chunk_index 紧随其后
         def sort_key(c):
             fn = c.get("file_name", "")
