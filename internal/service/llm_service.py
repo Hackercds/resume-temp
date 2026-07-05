@@ -301,7 +301,9 @@ class LLMService:
             "temperature": self.default_temperature,
             "max_tokens": self.default_max_tokens,
             "stream": True,
-            "stream_options": {"include_usage": False}
+            # 让 OpenAI 在最后一个 chunk 里返回 usage（prompt/completion/total tokens）
+            # 启用后客户端可以知道每次调用花了多少 token，做成本核算
+            "stream_options": {"include_usage": True}
         }
 
         try:
@@ -318,6 +320,12 @@ class LLMService:
                         try:
                             data = json.loads(data_str)
                         except json.JSONDecodeError:
+                            continue
+                        # OpenAI 流最后一个 chunk：choices=[], usage={prompt_tokens,completion_tokens,total_tokens}
+                        # 不再有文本 token，单独 yield 一个 usage marker 给 caller
+                        usage = data.get("usage")
+                        if usage:
+                            yield {"__usage__": usage}
                             continue
                         choices = data.get("choices", [])
                         if not choices:
@@ -425,6 +433,19 @@ class LLMService:
                                 text = delta.get("text", "")
                                 if text:
                                     yield text
+                        # Anthropic 流末尾的 message_delta 带 usage（input_tokens/output_tokens）
+                        elif event_type == "message_delta":
+                            usage = data.get("usage")
+                            if usage:
+                                # 转换为 OpenAI 同构字段，方便前端统一处理
+                                yield {
+                                    "__usage__": {
+                                        "prompt_tokens": usage.get("input_tokens", 0),
+                                        "completion_tokens": usage.get("output_tokens", 0),
+                                        "total_tokens": (usage.get("input_tokens", 0)
+                                                         + usage.get("output_tokens", 0)),
+                                    }
+                                }
                         # 忽略 thinking、content_block_start、content_block_stop 等
         except httpx.HTTPStatusError as e:
             if e.response is not None and e.response.status_code == 401:

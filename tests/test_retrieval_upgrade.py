@@ -1606,3 +1606,43 @@ class TestRewriteHistoryQuotedFiles:
         history = [{"role": "assistant", "content": "a"}]
         out = svc._rewrite_query("追问", "follow_up", history)
         assert out["history_quoted_files"] == []
+
+
+class TestBM25QueryUsesCompactVectorQuestion:
+    """v1.7 修复：BM25 query 必须用 vector_question（紧凑去污染实体句），
+    不能用 rewritten_question（"基于之前关于...的讨论"长对话摘要）。
+    后者会让本轮核心关键词（如 'LoopEngineering'）被摘要词稀释，召回不到。
+    这是用户报告「明明有却召回不到」的根因之一。
+    """
+
+    def test_bm25_query_matches_compact_question(self):
+        """在 stream 路径里 bm25_question = vector_question（不混 rewritten 长摘要）"""
+        from internal.service.rag_service import RAGService
+        svc = RAGService.__new__(RAGService)
+        # 静态校验：bm25_question 必须等于 vector_question（不能拿 rewritten）
+        # 这里通过 inspect 源文件做软断言，避免 mock 整个 query 流程
+        import inspect
+        src = inspect.getsource(svc.query_stream)
+        # 不应出现 `bm25_question = rewritten_question`
+        assert "bm25_question = rewritten_question" not in src, (
+            "regression: BM25 query should use compact vector_question, "
+            "not rewritten long context (causes keyword dilution)"
+        )
+
+    def test_sort_candidates_uses_rrf_score(self):
+        """_sort_candidates_by_score 优先用 _rrf_score，不用原始 score
+        （score 字段语义混乱：BM25 是 0-10、向量是 -0.04~1.0）"""
+        from internal.service.rag_service import RAGService
+        import inspect
+        src = inspect.getsource(RAGService._sort_candidates_by_score)
+        # 必须按 _rrf_score 排序
+        assert "_rrf_score" in src
+        # 不能再回退到只按 score 排
+        assert "key=lambda c: c.get(\"score\", 0)" not in src
+
+    def test_merge_candidates_takes_max_rrf_score(self):
+        """_merge_candidates 合并时保留 max(_rrf_score)，不能只看 score"""
+        from internal.service.rag_service import RAGService
+        import inspect
+        src = inspect.getsource(RAGService._merge_candidates)
+        assert "_rrf_score" in src, "merge must preserve _rrf_score across paths"

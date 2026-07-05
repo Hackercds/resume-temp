@@ -270,6 +270,9 @@ app.component('chat-panel', {
                                 <span><b>{{ msg.timing.embedding_ms }}ms</b> embed</span>
                                 <span><b>{{ msg.timing.search_ms }}ms</b> search</span>
                                 <span><b>{{ msg.timing.llm_s }}s</b> llm</span>
+                                <span v-if="msg.usage"><b>{{ msg.usage.total_tokens.toLocaleString() }}</b> tokens
+                                    <span class="meta-sub">(prompt {{ msg.usage.prompt_tokens.toLocaleString() }} · comp {{ msg.usage.completion_tokens.toLocaleString() }})</span>
+                                </span>
                             </div>
                             <div v-if="msg.sources && msg.sources.length" class="source-list">
                                 <div class="source-list-title">引用来源 ({{ dedupedSources(msg).length }} 个文档，{{ msg.sources.length }} 个片段)</div>

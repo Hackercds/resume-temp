@@ -1122,6 +1122,7 @@ h1, h2, h3, h4 { font-weight: 600; color: var(--text); line-height: 1.35; }
     font-size: 13px;
     border-radius: 4px;
 }
+.meta-sub { color: var(--text-3); font-weight: normal; margin-left: 4px; font-size: 11px; }
 .history-quoted {
     margin: 6px 0 0;
     padding: 6px 12px;

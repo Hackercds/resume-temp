@@ -320,8 +320,9 @@ class RAGService:
             # Step 2: ES 混合检索
             search_start = time.time()
             try:
-                # 主检索：向量用去污染的 vector_question；BM25 用 context（带对话上下文，多命中实体）
-                bm25_question = rewritten_question if use_expanded_for_vector else vector_question
+                # 关键设计（v1.7 修复）：BM25 query 用 vector_question（去污染实体句），
+                # 不再用 rewritten_question（长对话摘要）。详见 stream 路径注释。
+                bm25_question = vector_question
                 candidates = self.es.search_hybrid(
                     query_vector, query_text=bm25_question,
                     top_k=top_k * 2,
@@ -589,6 +590,25 @@ class RAGService:
         ))
         return has_specific and not has_cite
 
+    async def _iter_llm_stream(self, **kwargs):
+        """
+        流式调用 LLM 包装：
+        - 把 LLM 吐出的字符串 token 直接 yield 给 caller
+        - 把 {"__usage__": {...}} sentinel 截下，不 yield 给 caller，但存到 _usage
+        这样 caller 不需要知道 LLM 提供了 usage 信息，调用结束可读 _usage（thread-unsafe，
+        仅同协程内顺序调用）。
+        """
+        self._usage = {}
+        async for token in self.llm.generate_stream(**kwargs):
+            if isinstance(token, dict) and "__usage__" in token:
+                self._usage = token["__usage__"]
+                continue
+            yield token
+
+    def _last_usage(self) -> Dict:
+        """取出最近一次 _iter_llm_stream 调用收集的 usage，未拿到时返回空 dict"""
+        return getattr(self, "_usage", {}) or {}
+
     def _build_error_response(self, trace_id: str, timing: Dict, trace: Dict,
                               answer: str, suggestion: str = "",
                               empty_retrieval: bool = False,
@@ -626,17 +646,29 @@ class RAGService:
         return base
 
     def _merge_candidates(self, c1: List[Dict], c2: List[Dict]) -> List[Dict]:
-        """合并两路候选结果，去重并按分数排序"""
+        """合并两路候选结果，去重并按 _rrf_score 排序
+
+        重要：必须传 max(_rrf_score)，不能只看 score：
+        - score 字段语义混乱（BM25 是 0-10，向量是 -0.04~1.0）
+        - _rrf_score 是 RRF 融合后的统一可比分数（search_hybrid 内已写入）
+        多路 merge 时如果只看 score，BM25 高分会压过 RRF 真相，导致 RRF 排序失效。
+        """
         seen = {}
         for c in c1 + c2:
             cid = c.get("chunk_id")
             if not cid:
                 continue
             if cid in seen:
-                seen[cid]["score"] = max(seen[cid].get("score", 0), c.get("score", 0))
+                prev = seen[cid]
+                prev["score"] = max(prev.get("score", 0), c.get("score", 0))
+                prev["_rrf_score"] = max(prev.get("_rrf_score", 0) or 0,
+                                         c.get("_rrf_score", 0) or 0)
             else:
                 seen[cid] = dict(c)
-        return sorted(seen.values(), key=lambda x: x.get("score", 0), reverse=True)
+        return sorted(seen.values(),
+                      key=lambda x: (x.get("_rrf_score", 0) or 0,
+                                     x.get("score", 0)),
+                      reverse=True)
 
     def _diversify_by_document(self, candidates: List[Dict],
                                top_k: int, max_per_doc: int = 2) -> List[Dict]:
@@ -744,9 +776,22 @@ class RAGService:
 
     @staticmethod
     def _sort_candidates_by_score(candidates: List[Dict]) -> List[Dict]:
-        """按分数降序排序：优先 rerank_score，回退 score"""
-        return sorted(candidates, key=lambda c: c.get("rerank_score", c.get("score", 0)),
-                      reverse=True)
+        """
+        按分数降序排序：优先 _rrf_score（融合后真实分数），回退 score。
+        重要：纯 BM25 的 score 是 0-10 量级、纯向量的 score 是 -0.04~1.0 量级，
+        不归一化直接用 score 会让 BM25 命中压过向量命中，必须用 RRF 融合后的 _rrf_score。
+        这就是「明明有却召回不到」的根因之一：search_hybrid 返回的 candidates
+        同时存在 BM25-7.x 和 vector-0.x，必须按 RRF 排序才能公平比较。
+        """
+        return sorted(
+            candidates,
+            key=lambda c: (
+                c.get("_rrf_score", 0),
+                c.get("rerank_score", 0),
+                c.get("score", 0),
+            ),
+            reverse=True,
+        )
 
     async def query_stream(self, question: str, api_key: str,
                            provider: str = "openai", model: str = None,
@@ -833,13 +878,20 @@ class RAGService:
             # Step 2: ES 混合检索
             search_start = time.time()
             try:
-                bm25_question = rewritten_question if use_expanded_for_vector else vector_question
+                # 关键设计（v1.7 修复）：BM25 query 必须紧凑——长对话摘要/历史套话会污染关键词匹配。
+                # 之前用 rewritten_question（"基于之前关于...当前追问..."）做 BM25 query，
+                # 当本轮问题只是 "什么是 X" 这种短查询时，BM25 分数被摘要词稀释，
+                # 真正的关键词 "X" 反而匹配不到——这是「明明有却召回不到」的另一个根因。
+                # 正确做法：用 vector_question（去污染后的纯实体消解句）做 BM25 query。
+                bm25_question = vector_question
                 candidates = self.es.search_hybrid(
                     query_vector, query_text=bm25_question,
                     top_k=top_k * 2,
                     min_score=get_config().retrieval.min_score
                 )
 
+                # 多路召回：vector_question 已经是去污染实体句，再做 expanded vs rewritten 不同搜索意义不大。
+                # 保留扩展搜索，但要求 expanded != vector 才触发，避免冗余 + BM25 query 冲突。
                 if expanded_question != rewritten_question and not use_expanded_for_vector:
                     vec2 = self.embedding.encode_query(expanded_question)
                     expanded_candidates = self.es.search_hybrid(
@@ -978,7 +1030,7 @@ class RAGService:
                     llm_start = time.time()
                     answer_parts = []
                     try:
-                        async for token in self.llm.generate_stream(
+                        async for token in self._iter_llm_stream(
                             question=question, context=full_context,
                             api_key=api_key, provider=provider, model=model,
                             base_url=base_url, history=compressed_history,
@@ -1007,6 +1059,7 @@ class RAGService:
                             for d in full_docs
                         ],
                         "trace_id": trace_id, "timing": timing, "trace": trace,
+                        "usage": self._last_usage() or None,
                     }
                     return
 
@@ -1031,7 +1084,7 @@ class RAGService:
             llm_start = time.time()
             answer_parts = []
             try:
-                async for token in self.llm.generate_stream(
+                async for token in self._iter_llm_stream(
                     question=question,
                     context=context,
                     api_key=api_key,
@@ -1086,6 +1139,7 @@ class RAGService:
                 "timing": timing,
                 "trace": trace,
                 "ungrounded": self._detect_ungrounded(answer),
+                "usage": self._last_usage() or None,
             }
 
         except Exception as e:
