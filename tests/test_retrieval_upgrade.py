@@ -1646,3 +1646,94 @@ class TestBM25QueryUsesCompactVectorQuestion:
         import inspect
         src = inspect.getsource(RAGService._merge_candidates)
         assert "_rrf_score" in src, "merge must preserve _rrf_score across paths"
+
+
+class TestIntentClassificationEdgeCases:
+    """v1.8 修复：意图识别对重复问句 / 定义式 / 全新的判定。
+
+    之前问题：
+    - 重复追问被判 follow_up（正确但 conf=0.75 来自 <10 短路）
+    - "什么是 X" 定义式被判 follow_up（错，应该 new_topic）
+    - "Kafka 怎么用" 全新技术问句被判 follow_up（错，应该 new_topic）
+
+    用户截图显示 intent=follow_up 但 expanded_question == original_question + 
+    history_quoted_files 命中 — 表面工作，实际是分类器把 new_topic 错判 follow_up。
+    """
+
+    def _svc(self):
+        from internal.service.intent_service import IntentService
+        return IntentService()
+
+    def test_duplicate_question_recognized_as_follow_up(self):
+        svc = self._svc()
+        hist = [
+            {"role": "user", "content": "张成都是谁"},
+            {"role": "assistant", "content": "x",
+             "sources": [{"file_name": "简历.pdf", "score": 0.95}]},
+        ]
+        intent, conf = svc._rule_classify("张成都是谁", hist)
+        assert intent == "follow_up"
+        assert conf >= 0.6
+
+    def test_definition_question_recognized_as_new_topic(self):
+        svc = self._svc()
+        hist = [
+            {"role": "user", "content": "什么是 RAG"},
+            {"role": "assistant", "content": "x",
+             "sources": [{"file_name": "面试.md", "score": 0.95}]},
+        ]
+        intent, conf = svc._rule_classify("什么是 RAG", hist)
+        assert intent == "new_topic", (
+            f"'什么是 RAG' 应判 new_topic（用户首次问概念），实际 {intent}"
+        )
+
+    def test_howto_question_recognized_as_new_topic(self):
+        svc = self._svc()
+        hist = [
+            {"role": "user", "content": "张成都是谁"},
+            {"role": "assistant", "content": "x",
+             "sources": [{"file_name": "简历.pdf", "score": 0.95}]},
+        ]
+        intent, _ = svc._rule_classify("Kafka 怎么用", hist)
+        assert intent == "new_topic", (
+            f"'Kafka 怎么用' 应判 new_topic（全新主题），实际 {intent}"
+        )
+
+    def test_pronoun_followup_recognized_as_follow_up(self):
+        svc = self._svc()
+        hist = [
+            {"role": "user", "content": "张成都是谁"},
+            {"role": "assistant", "content": "张成都AI测试工程师",
+             "sources": [{"file_name": "简历.pdf", "score": 0.95}]},
+        ]
+        intent, conf = svc._rule_classify("他有什么技能", hist)
+        assert intent == "follow_up"
+        assert conf >= 0.85  # "他" 是强指代
+
+
+class TestPrimaryDocsOrderPreservesDiversity:
+    """v1.8 修复：trace.primary_docs 必须按 _diversify_by_document 输出顺序，
+    不是 set 遍历顺序（之前会与 sources 顺序不一致，调试时迷惑）。"""
+
+    def test_primary_docs_preserves_diversity_order(self):
+        import inspect
+        from internal.service.rag_service import RAGService
+        src = inspect.getsource(RAGService.query)
+        # 不能是 set comprehension（顺序不确定）
+        assert "list({c.get(\"file_name\")" not in src, (
+            "trace.primary_docs 必须保留 diversity 输出顺序，不应用 set comprehension"
+        )
+
+
+class TestContextQuestionCompactWhenNoEntity:
+    """v1.8 修复：follow_up 时若 expanded_question == original_question，
+    context_question 不再套「基于之前关于『X』的讨论」模板，改为简洁版。
+    之前会让 LLM context 多出 100+ 字符的冗余套话。"""
+
+    def test_no_redundant_context_when_expanded_equals_question(self):
+        import inspect
+        from internal.service.rag_service import RAGService
+        src = inspect.getsource(RAGService._rewrite_query)
+        assert "if expanded == question" in src, (
+            "follow_up 重写：当 expanded==question 时要用简洁版 context_question"
+        )

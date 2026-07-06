@@ -621,6 +621,7 @@ app.component('chat-panel', {
                         assistantMsgRef.trace_id = data.trace_id || '';
                         assistantMsgRef.trace = data.trace || null;
                         assistantMsgRef.ungrounded = !!data.ungrounded;
+                        assistantMsgRef.usage = data.usage || null;
                         assistantMsgRef.streaming = false;  // 立即切 Markdown 渲染
                         this.followUpQuestions = this._generateFollowUpQuestions(data.sources || []);
                         this.saveSession();
@@ -718,6 +719,7 @@ app.component('chat-panel', {
                         ref.sources = data.sources || [];
                         ref.timing = data.timing || null;
                         ref.ungrounded = !!data.ungrounded;
+                        ref.usage = data.usage || null;
                         ref.streaming = false;
                         this.saveSession();
                     },

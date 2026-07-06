@@ -91,12 +91,21 @@ class RAGService:
         )
 
         if intent == "follow_up":
-            prev_user = next((m for m in reversed(recent) if m.get('role') == 'user'), None)
-            prev_topic = prev_user.get('content', '') if prev_user else ''
-            result["context"] = (
-                f"基于之前关于「{prev_topic}」的讨论，当前追问：{expanded}\n\n"
-                f"前文摘要：{context_text[:200]}"
-            )
+            # expanded == question 表示没产生指代消解（追问就是原问题或问句里没有代词），
+            # 这时强行套"基于之前关于「x」的讨论"模板会引入冗余前缀，浪费 LLM context 字符。
+            # 改为：保留追问原文 + 简短摘要，让 LLM 看到"这就是上一轮问过的"即可。
+            if expanded == question:
+                result["context"] = (
+                    f"{question}\n\n"
+                    f"（这是对前文话题的追问，前文摘要：{context_text[:200]}）"
+                )
+            else:
+                prev_user = next((m for m in reversed(recent) if m.get('role') == 'user'), None)
+                prev_topic = prev_user.get('content', '') if prev_user else ''
+                result["context"] = (
+                    f"基于之前关于「{prev_topic}」的讨论，当前追问：{expanded}\n\n"
+                    f"前文摘要：{context_text[:200]}"
+                )
         elif intent == "summarize":
             result["context"] = f"请基于以下内容总结或对比：\n{context_text}\n\n用户要求：{question}"
         elif intent == "clarify":
@@ -424,7 +433,7 @@ class RAGService:
             else:
                 primary = self._sort_candidates_by_score(candidates)[:top_k]
             trace["primary_count"] = len(primary)
-            trace["primary_docs"] = list({c.get("file_name") for c in primary if c.get("file_name")})
+            trace["primary_docs"] = [c.get("file_name") for c in primary if c.get("file_name")]
 
             # Step 6: 检索仍为空时的兜底 + 引导
             if not primary:
@@ -692,13 +701,25 @@ class RAGService:
         """
         if not candidates:
             return []
-        # 按分数降序（rerank_score 优先，回退 score），entity_match/entity_chunk 优先
-        ranked = self._sort_candidates_by_score(candidates)
-        # entity_match 文档排前；同文档内 entity_chunk（含实体词）排前
-        ranked.sort(key=lambda c: (
-            not c.get("entity_match", False),
-            not c.get("entity_chunk", False),
-        ))
+        # 综合排序 key：(_rrf_score 反转, not entity_match, not entity_chunk)
+        # 这样：
+        #   - 高 RRF 分数的优先（按 RRF 真相排）
+        #   - 同 RRF 分数内 entity_match 文档优先（多轮识别的实体相关文档拉前）
+        #   - 同 entity_match 内 entity_chunk 优先（含实体词的具体 chunk）
+        #   - 最后回退到 chunk_index / score 作稳定排序
+        # 注意：之前这里的二次 .sort() 会覆盖 _rrf_score 排序——这是 bug
+        # （用 stable sort 一次性把多级 key 合并即可，避免覆盖）
+        ranked = sorted(
+            candidates,
+            key=lambda c: (
+                -(c.get("_rrf_score", 0) or 0),
+                -(c.get("rerank_score", 0) or 0),  # rerank 启用时按 rerank 排
+                not c.get("entity_match", False),
+                not c.get("entity_chunk", False),
+                -(c.get("score", 0) or 0),
+                c.get("chunk_index", 0) or 0,
+            ),
+        )
 
         if max_per_doc <= 0:
             return ranked[:top_k]
@@ -728,17 +749,27 @@ class RAGService:
                     selected.append(c)
             return selected
 
-        # 2. 第一轮：文档覆盖优先 —— 每个不同文档先各取1个代表
-        #    对 entity_match 文档：优先选 entity_chunk（含实体词的 chunk，如作者页 #0
-        #    而非案例页 #20），确保选中的 chunk 含实体信息供 LLM 提取
-        selected: List[Dict] = []
-        doc_count: Dict[str, int] = {}
-        # 2. 第一轮：文档覆盖优先 —— 每个不同文档先各取1个代表
-        #    ranked 已按 entity_match → entity_chunk → 分数 排序，故同文档内
-        #    entity_chunk（含实体词，如作者页 #0）先于非 entity_chunk（案例页 #20）被选
+        # 2. 第一轮：先取 entity_match 文档各 1 个 chunk（保证核心实体相关不被 cap 拦），
+        #    然后再取其他文档各 1 个 chunk（保证多文档佐证）
+        #    排序由 ranked 给出：entity_match 文档内部的 entity_chunk 已优先。
         selected: List[Dict] = []
         doc_count: Dict[str, int] = {}
         doc_seen: set = set()
+
+        # 2a. 先收齐所有 entity_match 文档各 1 个（保证用户问实体时至少答得到）
+        for c in ranked:
+            if len(selected) >= top_k:
+                break
+            fn = c.get("file_name", "")
+            if fn in doc_seen:
+                continue
+            if not c.get("entity_match", False):
+                continue
+            selected.append(c)
+            doc_count[fn] = 1
+            doc_seen.add(fn)
+
+        # 2b. 再补其他文档各 1 个（保留下剩余 top_k 席位的多样性）
         for c in ranked:
             if len(selected) >= top_k:
                 break
@@ -955,7 +986,7 @@ class RAGService:
             else:
                 primary = self._sort_candidates_by_score(candidates)[:top_k]
             trace["primary_count"] = len(primary)
-            trace["primary_docs"] = list({c.get("file_name") for c in primary if c.get("file_name")})
+            trace["primary_docs"] = [c.get("file_name") for c in primary if c.get("file_name")]
 
             # Step 6: 空检索兜底 + 引导
             if not primary:

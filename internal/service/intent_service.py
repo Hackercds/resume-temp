@@ -63,7 +63,7 @@ class IntentService:
             return "new_topic", 1.0
 
         # 2. 规则识别
-        intent, confidence = self._rule_classify(question)
+        intent, confidence = self._rule_classify(question, history)
         if confidence >= cfg.intent_rule_confidence_threshold:
             return intent, confidence
 
@@ -78,7 +78,34 @@ class IntentService:
 
         return intent, confidence
 
-    def _rule_classify(self, question: str) -> Tuple[str, float]:
+    def _is_question_duplicate(self, question: str, history: List[Dict]) -> bool:
+        """
+        判断当前问题是否与历史最近 user 重复/极相似。
+        用于：用户重复追问同一问题（例：刷新页面后再问一次）→ 识别为 follow_up；
+        而"什么是 X"（定义式）和同一句话的措辞相近但主题不同 → 不算重复。
+
+        用字符级 Jaccard 相似度 ≥ 0.7 判定（中文场景下对"张成都是谁"vs"张成都是谁"=1.0），
+        简单但对追问场景足够准。无需引入模糊匹配库。
+        """
+        prev_user = next((m for m in reversed(history) if m.get("role") == "user"), None)
+        if not prev_user:
+            return False
+        prev = (prev_user.get("content") or "").strip()
+        cur = question.strip()
+        if not prev or not cur:
+            return False
+        # 完全相同
+        if prev == cur:
+            return True
+        # Jaccard 字符集相似度
+        s1, s2 = set(prev), set(cur)
+        inter = s1 & s2
+        union = s1 | s2
+        if not union:
+            return False
+        return len(inter) / len(union) >= 0.7
+
+    def _rule_classify(self, question: str, history: List[Dict]) -> Tuple[str, float]:
         """规则版意图识别，返回意图 + 置信度"""
         q = question.strip().lower()
         stripped = question.strip()
@@ -104,12 +131,28 @@ class IntentService:
         if any(k in q for k in self._WEAK_FOLLOW_UP):
             return "follow_up", 0.80
 
-        # 极短问题（<10 字）且有历史 → 大概率追问
+        # 极短问题（<10 字）且有历史 → 大概率追问；但定义式/方法类问句属于 new_topic
         if len(stripped) < 10:
+            if re.match(r'^(什么是|是什么|什么叫|啥是|啥叫)', stripped):
+                return "new_topic", 0.75  # 短定义式问句：new_topic
+            if re.search(r'(怎么用|怎么实现|怎么配置|怎么做|怎么写|怎么搭|如何使用|如何用)', stripped):
+                return "new_topic", 0.75  # 含方法类动词：new_topic（不论开头）
             return "follow_up", 0.75
 
         # 问题较短（10-22 字）且以疑问词开头 → 可能是追问
+        # 但"什么是 X / X 是什么"这种**定义式问句**通常是 new_topic（无强指代 → 新话题）
+        # 用 history 最后一轮 user 句做去重：如果本轮问题与上一轮 user 重复/极相似 → follow_up
         if len(stripped) < 22 and re.match(r'^(为什么|怎么|多少|多久|哪些|什么样|哪|什么)', stripped):
+            if history and self._is_question_duplicate(question, history):
+                return "follow_up", 0.70  # 用户重复问同一问题 → 追问
+            # "什么是 X / X 是什么 / 什么叫 X / X 叫啥 / 啥是 X" → 定义式 → new_topic 候选
+            if re.match(r'^(什么是|是什么|什么叫|什么叫的是|啥是|啥叫)', stripped):
+                return "new_topic", 0.70
+            # "怎么用 / 怎么实现 / 如何使用 / 怎么配置 / 怎么做" → 操作/方法类问句 → new_topic
+            if re.match(r'^(怎么用|怎么实现|怎么配置|怎么做|怎么写|怎么搭|如何用|如何使用|如何实现|如何配置)',
+                       stripped):
+                return "new_topic", 0.70
+            # 其它疑问词开头 + 无指代 → 默认 follow_up
             return "follow_up", 0.65
 
         # 长问题但包含强对比结构（A 和 B 有什么区别）→ 结合历史判断
